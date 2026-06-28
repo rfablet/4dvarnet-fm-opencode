@@ -1,0 +1,17 @@
+{
+  "branch": "refactor/hydra-lightning",
+  "last_updated": null,
+  "phase_0_git_setup": "pending",
+  "phase_1_config_yaml_sync": "pending",
+  "phase_1_experiment_yamls": "pending",
+  "phase_1_to_lorenz63_config": "pending",
+  "phase_1_hydra_tests": "pending",
+  "phase_3_lightning_module": "pending",
+  "phase_4_pipeline_create": "pending",
+  "phase_4_pipeline_overfit_test": "pending",
+  "phase_5_train_py": "pending",
+  "phase_5_refactor_experiments": "pending",
+  "phase_5_checkpoint_compat_test": "pending",
+  "phase_6_update_training_tests": "pending",
+  "phase_7_cleanup": "pending"
+}

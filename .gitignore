@@ -42,3 +42,7 @@ Thumbs.db
 # Config with secrets
 opencode.json
 *.log
+
+# Generated data & checkpoints
+experiments/
+checkpoint_stage*.pt
