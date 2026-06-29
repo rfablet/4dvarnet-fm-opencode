@@ -163,5 +163,6 @@ def run_and_cache_baselines(datasets, device, batch_size=1, da_window_steps=None
     else:
         print("    (incomplete — skipping trajectory combination)")
 
-    subprocess.run([sys.executable, "generate_report.py"], capture_output=True)
+    subprocess.run([sys.executable, "generate_report.py",
+                    "--baselines", cache_path], capture_output=True)
     return partial

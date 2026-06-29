@@ -18,8 +18,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 COLORS_BL = {"Weak-4DVar": "#ff7f0e", "Strong-4DVar": "#2ca02c", "EnKF": "#d62728"}
 COLORS_FM = "#1f77b4"
 
-def load_baselines():
-    path = os.path.join(EXP_DIR, "baselines.json")
+def load_baselines(path=None):
+    if path is None:
+        path = os.path.join(EXP_DIR, "baselines.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
@@ -371,10 +372,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=os.path.join(OUTPUT_DIR, "synthesis_report.pdf"))
+    parser.add_argument("--baselines", default=None,
+                        help="Path to baselines JSON (e.g. experiments/baselines_dws50_inf1.2.json)")
     args = parser.parse_args()
 
     experiments = load_experiments()
-    baselines = load_baselines()
+    baselines = load_baselines(args.baselines)
     best = pick_best_fm(experiments)
 
     print(f"Experiments found: {len(experiments)}")
