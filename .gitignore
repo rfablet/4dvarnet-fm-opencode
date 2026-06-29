@@ -46,3 +46,6 @@ opencode.json
 # Generated data & checkpoints
 experiments/
 checkpoint_stage*.pt
+
+# SLURM logs
+sbatch_logs/

@@ -1,0 +1,6 @@
+# @package _global_
+note: "Smaller U-Net -- less overfitting"
+model:
+  hidden_channels: [32, 64, 128]
+training:
+  batch_size: 32
