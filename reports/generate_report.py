@@ -15,7 +15,7 @@ EXP_DIR = os.path.join(BASE, "experiments")
 OUTPUT_DIR = os.path.join(BASE, "reports", "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-COLORS_BL = {"Weak-4DVar": "#ff7f0e", "Strong-4DVar": "#2ca02c", "EnKF": "#d62728"}
+COLORS_BL = {"Weak-4DVar": "#ff7f0e", "Strong-4DVar": "#2ca02c", "EnKF": "#d62728", "ETKF": "#9467bd"}
 COLORS_FM = "#1f77b4"
 
 def load_baselines(path=None):
@@ -24,7 +24,43 @@ def load_baselines(path=None):
     if not os.path.exists(path):
         return None
     with open(path) as f:
-        return json.load(f)
+        baselines = json.load(f)
+
+    # Merge best ETKF result from ETKF-specific files (e.g. baselines_dws*_etkf_inf*.json)
+    basedir = os.path.dirname(path)
+    basename = os.path.basename(path)
+    stem, ext = os.path.splitext(basename)
+    etkf_pattern = stem + "_etkf_inf*" + ext
+    import glob
+    etkf_files = sorted(glob.glob(os.path.join(basedir, etkf_pattern)))
+    if not etkf_files:
+        # also try wildcard for dws that may differ
+        etkf_files = sorted(glob.glob(os.path.join(basedir, "baselines_dws*_etkf_inf*.json")))
+    if etkf_files:
+        best_cs2 = float("inf")
+        best_entry = None
+        for ef in etkf_files:
+            try:
+                with open(ef) as f:
+                    ed = json.load(f)
+            except Exception:
+                continue
+            c1 = ed.get("cs1", {}).get("ETKF")
+            c2 = ed.get("cs2", {}).get("ETKF")
+            if c1 is not None and c2 is not None:
+                cs2_mean = c2.get("mean", float("inf"))
+                if cs2_mean < best_cs2:
+                    best_cs2 = cs2_mean
+                    best_entry = (c1, c2)
+        if best_entry is not None:
+            if "cs1" not in baselines:
+                baselines["cs1"] = {}
+            if "cs2" not in baselines:
+                baselines["cs2"] = {}
+            baselines["cs1"]["ETKF"] = best_entry[0]
+            baselines["cs2"]["ETKF"] = best_entry[1]
+            print(f"  Merged best ETKF (CS2 μ={best_cs2:.4f}) from ETKF-specific files")
+    return baselines
 
 def load_experiments():
     results = []
@@ -51,9 +87,9 @@ def page_title(pdf, experiments, baselines, best):
     bl2 = {}
     if baselines:
         bl1 = {n: baselines["cs1"][n]["mean"]
-               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF"] if n in baselines.get("cs1", {})}
+               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"] if n in baselines.get("cs1", {})}
         bl2 = {n: baselines["cs2"][n]["mean"]
-               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF"] if n in baselines.get("cs2", {})}
+               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"] if n in baselines.get("cs2", {})}
     best_bl_cs1 = min(bl1.values()) if bl1 else 0
     best_bl_cs2 = min(bl2.values()) if bl2 else 0
 
@@ -92,7 +128,7 @@ def page_title(pdf, experiments, baselines, best):
         "-" * 60,
     ]
     if bl1 and bl2:
-        for name in ["Weak-4DVar", "Strong-4DVar", "EnKF"]:
+        for name in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"]:
             if name in bl1 and name in bl2:
                 m1, m2 = bl1[name], bl2[name]
                 d = m2 / (m1 + 1e-10)
@@ -124,7 +160,7 @@ def _bar_chart_page(pdf, experiments, baselines, cs_key, title):
     bl_names = []
     bl_vals = []
     if baselines:
-        bl_names = [n for n in ["Weak-4DVar", "Strong-4DVar", "EnKF"] if n in baselines.get(bl1_key, {})]
+        bl_names = [n for n in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"] if n in baselines.get(bl1_key, {})]
         bl_vals = [baselines[bl1_key][n]["mean"] for n in bl_names]
 
     labels = fm_ids + bl_names
@@ -182,7 +218,7 @@ def page_degradation(pdf, experiments, baselines):
     bl_names = []
     bl_vals = []
     if baselines and "cs1" in baselines and "cs2" in baselines:
-        bl_names = [n for n in ["Weak-4DVar", "Strong-4DVar", "EnKF"]
+        bl_names = [n for n in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"]
                     if n in baselines.get("cs1", {}) and n in baselines.get("cs2", {})]
         bl_vals = [baselines["cs2"][n]["mean"] / (baselines["cs1"][n]["mean"] + 1e-10) for n in bl_names]
 
@@ -277,9 +313,9 @@ def page_conclusion(pdf, experiments, baselines, best):
     bl2 = {}
     if baselines:
         bl1 = {n: baselines["cs1"][n]["mean"]
-               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF"] if n in baselines.get("cs1", {})}
+               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"] if n in baselines.get("cs1", {})}
         bl2 = {n: baselines["cs2"][n]["mean"]
-               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF"] if n in baselines.get("cs2", {})}
+               for n in ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"] if n in baselines.get("cs2", {})}
 
     lines = [
         "Conclusion & Recommendations  (live-updated)",

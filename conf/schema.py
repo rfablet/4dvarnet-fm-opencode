@@ -133,6 +133,11 @@ class EnKFConfig:
 
 
 @dataclass
+class ETKFConfig:
+    inflation: float = 1.0
+
+
+@dataclass
 class BaselinesConfig:
     da_window_steps: int = 300
     N_ensemble: int = 30
@@ -140,6 +145,7 @@ class BaselinesConfig:
     weak4dvar: Weak4DVarConfig = field(default_factory=Weak4DVarConfig)
     strong4dvar: Strong4DVarConfig = field(default_factory=Strong4DVarConfig)
     enkf: EnKFConfig = field(default_factory=EnKFConfig)
+    etkf: ETKFConfig = field(default_factory=ETKFConfig)
 
 
 @dataclass

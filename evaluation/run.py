@@ -3,14 +3,14 @@ import torch
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from data.lorenz63 import Lorenz63Config
-from evaluation.baselines import Weak4DVar, Strong4DVar, EnKF
+from evaluation.baselines import Weak4DVar, Strong4DVar, EnKF, ETKF
 from evaluation.metrics import rmse
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXP_DIR = os.path.join(BASE, "experiments")
 os.makedirs(EXP_DIR, exist_ok=True)
 
-_BASELINE_METHODS = ["Weak-4DVar", "Strong-4DVar", "EnKF"]
+_BASELINE_METHODS = ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"]
 _BASELINE_CASES = [("cs1", "test_cs1", 1, 0.0, "CS1"),
                    ("cs2", "test_cs2", 2, 0.15, "CS2")]
 
@@ -68,7 +68,8 @@ def evaluate_baseline(method, dataset, cfg, device, return_trajs=False, batch_si
 
 
 def run_and_cache_baselines(datasets, device, batch_size=1, da_window_steps=None,
-                             weak_config=None, strong_config=None, enkf_config=None):
+                             weak_config=None, strong_config=None, enkf_config=None,
+                             etkf_config=None):
     if da_window_steps is None:
         N = int(3.0 / 0.01)
     else:
@@ -77,6 +78,8 @@ def run_and_cache_baselines(datasets, device, batch_size=1, da_window_steps=None
     param_suffix = ""
     if enkf_config and enkf_config.get("inflation", 1.0) != 1.0:
         param_suffix += f"_inf{enkf_config['inflation']}"
+    if etkf_config and etkf_config.get("inflation", 1.0) != 1.0:
+        param_suffix += f"_etkf_inf{etkf_config['inflation']}"
     cache_path = os.path.join(EXP_DIR, f"baselines{dws_suffix}{param_suffix}.json")
 
     partial = {}
@@ -90,11 +93,13 @@ def run_and_cache_baselines(datasets, device, batch_size=1, da_window_steps=None
     weak_cfg = weak_config or {}
     strong_cfg = strong_config or {}
     enkf_cfg = enkf_config or {}
+    etkf_cfg = etkf_config or {}
 
     w4d = Weak4DVar(dt=0.01, da_window_steps=N, device=device, **weak_cfg)
     s4d = Strong4DVar(dt=0.01, da_window_steps=N, device=device, **strong_cfg)
     enkf = EnKF(dt=0.01, device=device, **enkf_cfg)
-    method_map = {"Weak-4DVar": w4d, "Strong-4DVar": s4d, "EnKF": enkf}
+    etkf = ETKF(dt=0.01, device=device, **etkf_cfg)
+    method_map = {"Weak-4DVar": w4d, "Strong-4DVar": s4d, "EnKF": enkf, "ETKF": etkf}
 
     cfg_cs1 = Lorenz63Config(case=1, param_bias=0.0, T_max=3.0, seed=123)
     cfg_cs2 = Lorenz63Config(case=2, param_bias=0.15, forcing_state_bias=0.15,

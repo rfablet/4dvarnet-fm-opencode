@@ -70,6 +70,10 @@ def main(cfg: DictConfig):
         "N_ensemble": bc.N_ensemble,
         "inflation": bc.enkf.inflation,
     } if "enkf" in bc else {}
+    etkf_config = {
+        "N_ensemble": bc.N_ensemble,
+        "inflation": bc.etkf.inflation,
+    } if "etkf" in bc else {}
 
     # Run baselines
     run_and_cache_baselines(
@@ -79,6 +83,7 @@ def main(cfg: DictConfig):
         weak_config=weak_config,
         strong_config=strong_config,
         enkf_config=enkf_config,
+        etkf_config=etkf_config,
     )
 
 

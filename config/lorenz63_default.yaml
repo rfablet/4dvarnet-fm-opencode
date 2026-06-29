@@ -68,6 +68,8 @@ baselines:
     lr: 0.1
   enkf:
     inflation: 1.0
+  etkf:
+    inflation: 1.0
 
 cs1:
   param_bias: 0.0

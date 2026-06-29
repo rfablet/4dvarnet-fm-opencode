@@ -17,11 +17,12 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 np.random.seed(0)
 
-METHODS = ["Weak-4DVar", "Strong-4DVar", "EnKF"]
+METHODS = ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"]
 METHOD_COLORS = {
     "Weak-4DVar": "#ff7f0e",
     "Strong-4DVar": "#2ca02c",
     "EnKF": "#d62728",
+    "ETKF": "#9467bd",
 }
 CASES = ["cs1", "cs2"]
 CASE_LABELS = {"cs1": "CS1", "cs2": "CS2"}
@@ -35,6 +36,7 @@ METHOD_PARAMS = {
     "Weak-4DVar": {"opt_steps": 150, "lr": 0.02, "da_window_steps": 50},
     "Strong-4DVar": {"max_iter": 40, "lr": 0.1, "da_window_steps": 50},
     "EnKF": {"N_ensemble": 30, "inflation": 1.2},
+    "ETKF": {"N_ensemble": 30, "inflation": 1.0},
 }
 
 CS_PARAMS = {
@@ -185,6 +187,7 @@ def main():
             f"  Weak-4DVar : opt_steps=150, lr=0.02",
             f"  Strong-4DVar: max_iter=40, lr=0.1",
             f"  EnKF       : N_ensemble=30, inflation={inf_val}",
+            f"  ETKF       : N_ensemble=30, inflation=1.0 (deterministic transform)",
             "",
             "Case studies:",
             "-" * 100,
@@ -268,7 +271,56 @@ def main():
         plt.close()
         print("  Page 2: Metrics table")
 
-        # ── Pages 3-8: Trajectories ──
+        # ── Page 3: Comparison bar charts ──
+        fig, axes = plt.subplots(1, 3, figsize=(13, 5))
+        fig.suptitle("Baseline Comparison — Mean RMSE", fontsize=14, fontweight="bold")
+
+        bar_data = [
+            ("CS1 μ", [metrics.get("cs1", {}).get(m, {}).get("mean", float("nan")) for m in METHODS]),
+            ("CS2 μ", [metrics.get("cs2", {}).get(m, {}).get("mean", float("nan")) for m in METHODS]),
+        ]
+        for ax, (title, vals) in zip(axes[:2], bar_data):
+            colors = [METHOD_COLORS[m] for m in METHODS]
+            bars = ax.bar(range(len(METHODS)), vals, color=colors, width=0.55, edgecolor="white")
+            for bar, val in zip(bars, vals):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                        f"{val:.4f}", ha="center", va="bottom", fontsize=8)
+            ax.set_xticks(range(len(METHODS)))
+            ax.set_xticklabels(METHODS, fontsize=8, rotation=25, ha="right")
+            ax.set_ylabel("Mean RMSE", fontsize=10)
+            ax.set_title(title, fontsize=11)
+            ax.grid(True, axis="y", alpha=0.3, ls="--")
+            if vals:
+                ax.set_ylim(0, max(vals) * 1.3)
+
+        # Degradation bar chart
+        ax = axes[2]
+        deg_vals = []
+        for m in METHODS:
+            c1 = metrics.get("cs1", {}).get(m, {}).get("mean", float("nan"))
+            c2 = metrics.get("cs2", {}).get(m, {}).get("mean", float("nan"))
+            deg_vals.append(c2 / c1 if c1 and c1 > 0 else float("nan"))
+        colors = [METHOD_COLORS[m] for m in METHODS]
+        bars = ax.bar(range(len(METHODS)), deg_vals, color=colors, width=0.55, edgecolor="white")
+        for bar, val in zip(bars, deg_vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.03,
+                    f"{val:.2f}x", ha="center", va="bottom", fontsize=8, fontweight="bold")
+        ax.axhline(1.0, color="gray", ls=":", lw=1, alpha=0.5, label="Ideal (1.0x)")
+        ax.set_xticks(range(len(METHODS)))
+        ax.set_xticklabels(METHODS, fontsize=8, rotation=25, ha="right")
+        ax.set_ylabel("Degradation (CS2 μ / CS1 μ)", fontsize=10)
+        ax.set_title("Robustness", fontsize=11)
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(True, axis="y", alpha=0.3, ls="--")
+        if deg_vals:
+            ax.set_ylim(0, max(deg_vals) * 1.35)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.94])
+        pdf.savefig(fig)
+        plt.close()
+        print("  Page 3: Comparison bar charts")
+
+        # ── Pages 4-9: Trajectories ──
         for case in CASES:
             for method in METHODS:
                 make_trajectory_page(pdf, trajs_data, case, method)
