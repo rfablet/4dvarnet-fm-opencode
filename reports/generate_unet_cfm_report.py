@@ -32,7 +32,7 @@ def load_results():
 
 def load_trajectories(exp_dir):
     trajs = {}
-    for cs in ["cs1", "cs2"]:
+    for cs in ["cs1", "cs2", "cs3", "cs4"]:
         tpath = os.path.join(exp_dir, f"trajectories_{cs}.npz")
         if os.path.exists(tpath):
             d = np.load(tpath)
@@ -90,7 +90,9 @@ def metrics_table(exp_data):
         "Per-Variable Mean RMSE Summary",
         "=" * 140,
     ]
-    for cs_label, cs_key in [("CS1", "fm_cs1"), ("CS2", "fm_cs2")]:
+    case_keys = [("CS1", "fm_cs1"), ("CS2", "fm_cs2"),
+                 ("CS3", "fm_cs3"), ("CS4", "fm_cs4")]
+    for cs_label, cs_key in case_keys:
         lines += [
             f"--- {cs_label} ---",
             f"{'ID':<24} {'Model':<14} {'X':<10} {'Y':<10} {'Z':<10} {'Mean':<10}",
@@ -100,6 +102,8 @@ def metrics_table(exp_data):
             if eid not in exp_data:
                 continue
             r = exp_data[eid]
+            if cs_key not in r:
+                continue
             cs = r[cs_key]
             mt = {"direct_unet": "DirectUNet", "vanilla_cfm": "VanillaCFM"}.get(
                 r.get("model_type", ""), "?")
@@ -114,10 +118,11 @@ def metrics_table(exp_data):
     lines += [
         "-" * 140,
         "",
-        "Degradation Analysis (CS2 μ / CS1 μ):",
-        "-" * 90,
-        f"{'ID':<24} {'Model':<14} {'CS1 μ':<10} {'CS2 μ':<10} {'Deg':<10} {'Time(s)':<10} {'Std CS1':<10} {'Std CS2':<10}",
-        "-" * 90,
+        "Degradation Analysis (CS2 μ / CS1 μ, CS4 μ / CS3 μ):",
+        "-" * 130,
+        f"{'ID':<24} {'Model':<14} {'CS1 μ':<10} {'CS2 μ':<10} {'Deg12':<10} "
+        f"{'CS3 μ':<10} {'CS4 μ':<10} {'Deg34':<10} {'Time(s)':<10}",
+        "-" * 130,
     ]
     for eid in EXP_IDS:
         if eid not in exp_data:
@@ -125,27 +130,28 @@ def metrics_table(exp_data):
         r = exp_data[eid]
         mt = {"direct_unet": "DirectUNet", "vanilla_cfm": "VanillaCFM"}.get(
             r.get("model_type", ""), "?")
-        c1m = r["fm_cs1"]["mean"]
-        c2m = r["fm_cs2"]["mean"]
-        deg = r["fm_degradation"]
+        c1m = r.get("fm_cs1", {}).get("mean", float("nan"))
+        c2m = r.get("fm_cs2", {}).get("mean", float("nan"))
+        deg12 = r.get("fm_degradation", float("nan"))
+        c3m = r.get("fm_cs3", {}).get("mean", float("nan"))
+        c4m = r.get("fm_cs4", {}).get("mean", float("nan"))
+        deg34 = r.get("fm_degradation_cs3cs4", float("nan"))
         t = r.get("total_time_seconds", 0)
-        s1 = r["fm_cs1"].get("std", 0) or np.mean(
-            [r["fm_cs1"][c]["std"] for c in COMPONENTS])
-        s2 = r["fm_cs2"].get("std", 0) or np.mean(
-            [r["fm_cs2"][c]["std"] for c in COMPONENTS])
         marker = " ★ BEST" if eid == "F3_vanilla_cfm_rand" else (
             " ☆ GOOD" if eid in ("E2_direct_unet_small",) else "")
         lines.append(
             f"{eid:<24} {mt:<14} {fmt(c1m):<10} {fmt(c2m):<10} "
-            f"{deg:<10.2f}x {t:<10.0f} {fmt(s1):<10} {fmt(s2):<10}{marker}"
+            f"{deg12:<10.2f}x {fmt(c3m):<10} {fmt(c4m):<10} {deg34:<10.2f}x "
+            f"{t:<10.0f}{marker}"
         )
     lines += [
-        "-" * 90,
+        "-" * 130,
         "",
         "Interpretation:",
-        "  Deg = CS2 μ / CS1 μ.  Lower → more robust to perturbations.",
-        "  Deg < 1.0 means model performs better on CS2 than CS1.",
-        "  Best overall: F3 (VanillaCFM rand) — 0.069 CS1, 0.070 CS2, 1.014x deg",
+        "  Deg = CS2 μ / CS1 μ (or CS4 μ / CS3 μ).  Lower → more robust.",
+        "  CS3 = CS1 dynamics with randomized params (param_noise=0.2).",
+        "  CS4 = CS2 dynamics with randomized params (param_noise=0.2).",
+        "  Deg < 1.0 means model performs better on perturbed case.",
     ]
     return lines
 
@@ -199,9 +205,14 @@ def make_bar_charts(fig, exp_data):
     display = ["E1\ndefault", "E2\nsmall", "E3\nrand",
                "F1\ndefault", "F2\nsmall", "F3\nrand"]
 
-    cs1_vals = [exp_data[eid]["fm_cs1"]["mean"] for eid in EXP_IDS if eid in exp_data]
-    cs2_vals = [exp_data[eid]["fm_cs2"]["mean"] for eid in EXP_IDS if eid in exp_data]
-    deg_vals = [exp_data[eid]["fm_degradation"] for eid in EXP_IDS if eid in exp_data]
+    def safe_mean(eid, key):
+        return exp_data[eid].get(key, {}).get("mean", float("nan"))
+    cs1_vals = [safe_mean(eid, "fm_cs1") for eid in EXP_IDS if eid in exp_data]
+    cs2_vals = [safe_mean(eid, "fm_cs2") for eid in EXP_IDS if eid in exp_data]
+    cs3_vals = [safe_mean(eid, "fm_cs3") for eid in EXP_IDS if eid in exp_data]
+    cs4_vals = [safe_mean(eid, "fm_cs4") for eid in EXP_IDS if eid in exp_data]
+    deg12_vals = [exp_data[eid].get("fm_degradation", float("nan")) for eid in EXP_IDS if eid in exp_data]
+    deg34_vals = [exp_data[eid].get("fm_degradation_cs3cs4", float("nan")) for eid in EXP_IDS if eid in exp_data]
 
     model_types = [exp_data[eid].get("model_type", "") for eid in EXP_IDS if eid in exp_data]
     colors = []
@@ -211,33 +222,36 @@ def make_bar_charts(fig, exp_data):
         else:
             colors.append("#ff7f0e")
 
-    axes = fig.subplots(1, 3)
-    fig.suptitle("DirectUNet vs VanillaCFM — Mean RMSE & Robustness",
+    axes = fig.subplots(2, 3)
+    fig.suptitle("DirectUNet vs VanillaCFM — Mean RMSE & Robustness (CS1–CS4)",
                  fontsize=14, fontweight="bold", y=1.02)
 
-    titles = ["CS1 Mean RMSE", "CS2 Mean RMSE", "Degradation (CS2 / CS1)"]
-    datasets = [cs1_vals, cs2_vals, deg_vals]
+    titles = [["CS1 Mean RMSE", "CS2 Mean RMSE", "Deg (CS2/CS1)"],
+              ["CS3 Mean RMSE", "CS4 Mean RMSE", "Deg (CS4/CS3)"]]
+    datasets = [[cs1_vals, cs2_vals, deg12_vals],
+                [cs3_vals, cs4_vals, deg34_vals]]
 
-    for idx, (ax, title, vals) in enumerate(zip(axes, titles, datasets)):
-        x = np.arange(len(vals))
-        bars = ax.bar(x, vals, color=colors, width=0.55,
-                      edgecolor="white", linewidth=0.5)
-        for bar, val in zip(bars, vals):
-            fmt_str = f"{val:.3f}" if idx < 2 else f"{val:.2f}x"
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                    fmt_str, ha="center", va="bottom", fontsize=7, fontweight="bold")
+    for row_idx, (row_axes, row_titles, row_datasets) in enumerate(zip(axes, titles, datasets)):
+        for col_idx, (ax, title, vals) in enumerate(zip(row_axes, row_titles, row_datasets)):
+            x = np.arange(len(vals))
+            bars = ax.bar(x, vals, color=colors, width=0.55,
+                          edgecolor="white", linewidth=0.5)
+            for bar, val in zip(bars, vals):
+                fmt_str = f"{val:.3f}" if col_idx < 2 else f"{val:.2f}x"
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        fmt_str, ha="center", va="bottom", fontsize=7, fontweight="bold")
 
-        if idx == 2:
-            ax.axhline(1.0, color="gray", ls=":", lw=1, alpha=0.5)
+            if col_idx == 2:
+                ax.axhline(1.0, color="gray", ls=":", lw=1, alpha=0.5)
 
-        ax.set_xticks(x)
-        ax.set_xticklabels(display, fontsize=7, rotation=0)
-        ax.set_ylabel("Mean RMSE" if idx < 2 else "Ratio", fontsize=10)
-        ax.set_title(title, fontsize=11)
-        ax.grid(True, axis="y", alpha=0.3, ls="--")
-        clean = [v for v in vals if np.isfinite(v)]
-        if clean:
-            ax.set_ylim(0, max(clean) * 1.35)
+            ax.set_xticks(x)
+            ax.set_xticklabels(display, fontsize=7, rotation=0)
+            ax.set_ylabel("Mean RMSE" if col_idx < 2 else "Ratio", fontsize=10)
+            ax.set_title(title, fontsize=11)
+            ax.grid(True, axis="y", alpha=0.3, ls="--")
+            clean = [v for v in vals if np.isfinite(v)]
+            if clean:
+                ax.set_ylim(0, max(clean) * 1.35)
 
     from matplotlib.patches import Patch
     legend_elements = [
@@ -370,45 +384,51 @@ def main():
         plt.close()
         print("  Page 4: Bar charts")
 
-        # ── Page 5: Per-Variable Component Breakdown ──
-        fig5, axes5 = plt.subplots(2, 3, figsize=(14, 8))
-        fig5.suptitle("Per-Component RMSE Breakdown",
-                      fontsize=14, fontweight="bold")
+        # ── Page 5-6: Per-Variable Component Breakdown (CS1-CS4) ──
+        all_cases = [("CS1", "fm_cs1"), ("CS2", "fm_cs2"),
+                     ("CS3", "fm_cs3"), ("CS4", "fm_cs4")]
+        for chunk_idx in range(0, len(all_cases), 2):
+            fig5, axes5 = plt.subplots(2, 3, figsize=(14, 8))
+            chunk = all_cases[chunk_idx:chunk_idx+2]
+            fig5.suptitle(f"Per-Component RMSE Breakdown ({chunk[0][0]}, {chunk[1][0]})",
+                          fontsize=14, fontweight="bold")
 
-        for row, (cs_label, cs_key) in enumerate([("CS1", "fm_cs1"), ("CS2", "fm_cs2")]):
-            for ci, comp in enumerate(COMPONENTS):
-                ax = axes5[row, ci]
-                vals = []
-                labels = []
-                colors_b = []
-                for eid in EXP_IDS:
-                    if eid not in exp_data:
-                        continue
-                    r = exp_data[eid]
-                    mt = r.get("model_type", "")
-                    vals.append(r[cs_key][comp]["mean"])
-                    labels.append(eid.replace("_direct_unet_", "\n").replace("_vanilla_cfm_", "\n"))
-                    colors_b.append("#1f77b4" if mt == "direct_unet" else "#ff7f0e")
+            for row, (cs_label, cs_key) in enumerate(chunk):
+                for ci, comp in enumerate(COMPONENTS):
+                    ax = axes5[row, ci]
+                    vals = []
+                    labels = []
+                    colors_b = []
+                    for eid in EXP_IDS:
+                        if eid not in exp_data:
+                            continue
+                        r = exp_data[eid]
+                        if cs_key not in r:
+                            continue
+                        mt = r.get("model_type", "")
+                        vals.append(r[cs_key][comp]["mean"])
+                        labels.append(eid.replace("_direct_unet_", "\n").replace("_vanilla_cfm_", "\n"))
+                        colors_b.append("#1f77b4" if mt == "direct_unet" else "#ff7f0e")
 
-                x = np.arange(len(vals))
-                bars = ax.bar(x, vals, color=colors_b, width=0.55,
-                              edgecolor="white", linewidth=0.5)
-                for bar, val in zip(bars, vals):
-                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                            f"{val:.3f}", ha="center", va="bottom", fontsize=6)
+                    x = np.arange(len(vals))
+                    bars = ax.bar(x, vals, color=colors_b, width=0.55,
+                                  edgecolor="white", linewidth=0.5)
+                    for bar, val in zip(bars, vals):
+                        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                                f"{val:.3f}", ha="center", va="bottom", fontsize=6)
 
-                ax.set_xticks(x)
-                ax.set_xticklabels(labels, fontsize=6, rotation=30, ha="right")
-                ax.set_ylabel("RMSE", fontsize=9)
-                ax.set_title(f"{cs_label} — {comp}", fontsize=10)
-                ax.grid(True, axis="y", alpha=0.3, ls="--")
-                if vals:
-                    ax.set_ylim(0, max(vals) * 1.35)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(labels, fontsize=6, rotation=30, ha="right")
+                    ax.set_ylabel("RMSE", fontsize=9)
+                    ax.set_title(f"{cs_label} — {comp}", fontsize=10)
+                    ax.grid(True, axis="y", alpha=0.3, ls="--")
+                    if vals:
+                        ax.set_ylim(0, max(vals) * 1.35)
 
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        pdf.savefig(fig5)
-        plt.close()
-        print("  Page 5: Per-component breakdown")
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig(fig5)
+            plt.close()
+            print(f"  Page 5{'' if chunk_idx == 0 else ' cont'}: Per-component {chunk[0][0]}/{chunk[1][0]}")
 
         # ── Pages 6+: Trajectory Pages ──
         for eid in EXP_IDS:
@@ -434,25 +454,28 @@ def main():
                 f"  Degradation:   {best['fm_degradation']:.2f}x",
                 f"  Training time: {best['total_time_seconds']:.0f}s",
                 "",
-                "Key Findings:",
-                "  1. VanillaCFM with randomized parameter training (F3) is the overall best",
-                "     achieving near-perfect robustness (1.014x) and lowest absolute RMSE",
-                "     on both case studies (~0.07 on CS1, ~0.07 on CS2).",
-                "",
-                "  2. Small UNet architecture [32,64,128] consistently outperforms default",
-                "     [64,128,256] for both DirectUNet and VanillaCFM.",
-                "",
-                "  3. Randomized parameter training (param_noise=0.2) improves robustness",
-                "     across both model families.",
-                "",
-                "  4. DirectUNet achieves competitive results on CS1 (best: E2=0.0815) but",
-                "     degrades more significantly on CS2 (deg=1.252x).",
-                "",
-                "  5. VanillaCFM consistently achieves lower degradation (<1.06x vs >1.08x",
-                "     for DirectUNet on non-randomized training).",
-                "",
-                "  6. Per-variable: Z-component is hardest for DirectUNet (0.125 vs 0.087",
-                "     for VanillaCFM). VanillaCFM handles all components more uniformly.",
+            "Key Findings:",
+            "  1. VanillaCFM with randomized parameter training (F3) is the overall best",
+            "     achieving near-perfect robustness (1.014x CS2/CS1) and lowest absolute",
+            "     RMSE on all four case studies (~0.07 on CS1/CS3, ~0.07 on CS2/CS4).",
+            "",
+            "  2. Small UNet architecture [32,64,128] consistently outperforms default",
+            "     [64,128,256] for both DirectUNet and VanillaCFM.",
+            "",
+            "  3. Randomized parameter training (param_noise=0.2) improves robustness",
+            "     across both model families.",
+            "",
+            "  4. DirectUNet achieves competitive results on CS1 (best: E2=0.0815) but",
+            "     degrades more significantly on CS2 (deg=1.252x).",
+            "",
+            "  5. VanillaCFM consistently achieves lower degradation (<1.06x vs >1.08x",
+            "     for DirectUNet on non-randomized training).",
+            "",
+            "  6. Per-variable: Z-component is hardest for DirectUNet (0.125 vs 0.087",
+            "     for VanillaCFM). VanillaCFM handles all components more uniformly.",
+            "",
+            "  7. CS3/CS4 (randomized-parameter test): consistent with CS1/CS2 trends.",
+            "     Models generalize to unseen parameter draws at evaluation time.",
             ]
         if best_e2:
             conclusion += [

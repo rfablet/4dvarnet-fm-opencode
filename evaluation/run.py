@@ -11,8 +11,12 @@ EXP_DIR = os.path.join(BASE, "experiments")
 os.makedirs(EXP_DIR, exist_ok=True)
 
 _BASELINE_METHODS = ["Weak-4DVar", "Strong-4DVar", "EnKF", "ETKF"]
-_BASELINE_CASES = [("cs1", "test_cs1", 1, 0.0, "CS1"),
-                   ("cs2", "test_cs2", 2, 0.15, "CS2")]
+_BASELINE_CASES = [
+    ("cs1", "test_cs1", 1, 0.0, "CS1", "linear"),
+    ("cs2", "test_cs2", 2, 0.15, "CS2", "quartic"),
+    ("cs3", "test_cs3", 1, 0.0, "CS3", "linear"),
+    ("cs4", "test_cs4", 2, 0.15, "CS4", "quartic"),
+]
 
 
 def _baseline_traj_path(case_name, method_name, dws_suffix="", param_suffix=""):
@@ -95,25 +99,34 @@ def run_and_cache_baselines(datasets, device, batch_size=1, da_window_steps=None
     enkf_cfg = enkf_config or {}
     etkf_cfg = etkf_config or {}
 
-    w4d = Weak4DVar(dt=0.01, da_window_steps=N, device=device, **weak_cfg)
-    s4d = Strong4DVar(dt=0.01, da_window_steps=N, device=device, **strong_cfg)
-    enkf = EnKF(dt=0.01, device=device, **enkf_cfg)
-    etkf = ETKF(dt=0.01, device=device, **etkf_cfg)
-    method_map = {"Weak-4DVar": w4d, "Strong-4DVar": s4d, "EnKF": enkf, "ETKF": etkf}
+    baseline_pool = {}
+    for coupling_type in ("linear", "quartic"):
+        baseline_pool[coupling_type] = {
+            "Weak-4DVar": Weak4DVar(dt=0.01, da_window_steps=N, device=device,
+                                     coupling_type=coupling_type, **weak_cfg),
+            "Strong-4DVar": Strong4DVar(dt=0.01, da_window_steps=N, device=device,
+                                         coupling_type=coupling_type, **strong_cfg),
+            "EnKF": EnKF(dt=0.01, device=device, coupling_type=coupling_type, **enkf_cfg),
+            "ETKF": ETKF(dt=0.01, device=device, coupling_type=coupling_type, **etkf_cfg),
+        }
 
     cfg_cs1 = Lorenz63Config(case=1, param_bias=0.0, T_max=3.0, seed=123)
     cfg_cs2 = Lorenz63Config(case=2, param_bias=0.15, forcing_state_bias=0.15,
                               forcing_coupling="quartic", T_max=3.0, seed=124)
-    cfg_map = {"cs1": cfg_cs1, "cs2": cfg_cs2}
+    cfg_cs3 = Lorenz63Config(case=1, param_bias=0.0, T_max=3.0, seed=125)
+    cfg_cs4 = Lorenz63Config(case=2, param_bias=0.15, forcing_state_bias=0.15,
+                              forcing_coupling="quartic", T_max=3.0, seed=126)
+    cfg_map = {"cs1": cfg_cs1, "cs2": cfg_cs2, "cs3": cfg_cs3, "cs4": cfg_cs4}
 
     if "config" not in partial:
         partial["config"] = {"T_max": 3.0, "da_window_steps": N}
 
     total_t0 = time.time()
 
-    for case_name, ds_key, case_val, bias, label in _BASELINE_CASES:
+    for case_name, ds_key, case_val, bias, label, coupling_type in _BASELINE_CASES:
         ds = datasets[ds_key]
         cfg = cfg_map[case_name]
+        method_map = baseline_pool[coupling_type]
         for name in _BASELINE_METHODS:
             if partial.get(case_name, {}).get(name) is not None:
                 print(f"    {label}/{name:<15} already done, skipping")
@@ -147,14 +160,14 @@ def run_and_cache_baselines(datasets, device, batch_size=1, da_window_steps=None
     traj_path = os.path.join(EXP_DIR, f"baselines_trajectories{dws_suffix}{param_suffix}.npz")
     all_present = all(
         os.path.exists(_baseline_traj_path(case_name, name, dws_suffix, param_suffix))
-        for case_name, _, _, _, _ in _BASELINE_CASES
+        for case_name, _, _, _, _, _ in _BASELINE_CASES
         for name in _BASELINE_METHODS
     )
 
     if all_present:
         print("  Combining trajectories...")
         traj_arrays = {}
-        for case_name, _, _, _, _ in _BASELINE_CASES:
+        for case_name, _, _, _, _, _ in _BASELINE_CASES:
             for name in _BASELINE_METHODS:
                 src = _baseline_traj_path(case_name, name, dws_suffix, param_suffix)
                 data = np.load(src)

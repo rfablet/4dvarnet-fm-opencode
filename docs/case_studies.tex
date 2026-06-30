@@ -8,7 +8,7 @@
 \usepackage{hyperref}
 \usepackage{enumitem}
 
-\title{Case Studies CS1 and CS2:\\Stochastic Lorenz-63 Data Assimilation}
+\title{Case Studies CS1--CS4:\\Stochastic Lorenz-63 Data Assimilation}
 \author{4DVarNet-FM}
 \date{}
 
@@ -97,6 +97,31 @@ The coupling in $\dot X$ is changed from linear to quartic:
 c_1\,W_L \;\longrightarrow\; \operatorname{sgn}(W_L)\,W_L^2,
 \]
 which introduces a stronger and non-symmetric forcing on the $X$ variable.
+
+\section{Case Study CS3: Randomised Parameters (Linear Coupling)}
+
+CS3 applies the same parameter randomisation used during $E3/F3$ training to the CS1 configuration (linear coupling, no forcing corruption). Each test window draws random parameters:
+
+\[
+\sigma \sim \mathcal{U}\bigl(\sigma_{\text{true}}(1 - \epsilon),\;\sigma_{\text{true}}(1 + \epsilon)\bigr),\quad
+\rho \sim \mathcal{U}\bigl(\rho_{\text{true}}(1 - \epsilon),\;\rho_{\text{true}}(1 + \epsilon)\bigr),\quad
+\beta \sim \mathcal{U}\bigl(\beta_{\text{true}}(1 - \epsilon),\;\beta_{\text{true}}(1 + \epsilon)\bigr),
+\]
+
+with $\epsilon = 0.2$ (20\% noise), independently per window. The forcing is the true wind $W_L$ (uncorrupted) and the coupling in $\dot X$ remains linear.
+
+\section{Case Study CS4: Randomised Parameters (Quartic Coupling)}
+
+CS4 combines the CS2 model mismatch (parameter bias, OU-corrupted forcing, quartic coupling) with the same per-window parameter randomisation used in CS3:
+
+\begin{itemize}[noitemsep]
+\item Parameter bias $b = 0.15$ applied after randomisation.
+\item Forcing corrupted by OU process $\eta$ and state-dependent term $\alpha X$ ($\alpha = 0.15$).
+\item Coupling: quartic $\operatorname{sgn}(W_L)\,W_L^2$.
+\item Per-window parameter noise $\epsilon = 0.2$ (same as CS3).
+\end{itemize}
+
+This is the most challenging case: the model must handle simultaneously (i) biased parameters, (ii) corrupted forcing, (iii) nonlinear coupling, and (iv) unseen random parameter draws.
 
 \section{Parameter Summary}
 

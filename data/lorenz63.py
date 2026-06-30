@@ -213,7 +213,10 @@ def make_datasets(cfg: Lorenz63Config) -> Dict[str, Lorenz63Dataset]:
 def make_mixed_datasets(cfg: Lorenz63Config, *,
                         num_train_windows: int = 1000,
                         num_val_windows: int = 100,
-                        num_test_windows: int = 200) -> Dict[str, Lorenz63Dataset]:
+                        num_test_windows: int = 200,
+                        include_randparam_test: bool = True,
+                        param_noise: float = 0.2) -> Dict[str, Lorenz63Dataset]:
+    from data.random_param_dataset import RandomParamLorenz63Dataset
     base = cfg.__dict__.copy()
     train_cs1_cfg = Lorenz63Config(**{**base, "case": 1, "param_bias": 0.0, "seed": 42, "num_windows": num_train_windows})
     train_cs2_cfg = Lorenz63Config(**{**base, "case": 2, "param_bias": 0.15, "forcing_state_bias": 0.15, "seed": 42, "num_windows": num_train_windows, "forcing_coupling": "quartic"})
@@ -221,8 +224,10 @@ def make_mixed_datasets(cfg: Lorenz63Config, *,
     val_cs2_cfg = Lorenz63Config(**{**base, "case": 2, "param_bias": 0.15, "forcing_state_bias": 0.15, "seed": 99, "num_windows": num_val_windows})
     test_cs1_cfg = Lorenz63Config(**{**base, "case": 1, "param_bias": 0.0, "seed": 123, "num_windows": num_test_windows})
     test_cs2_cfg = Lorenz63Config(**{**base, "case": 2, "param_bias": 0.15, "forcing_state_bias": 0.15, "seed": 124, "num_windows": num_test_windows})
+    test_cs3_cfg = Lorenz63Config(**{**base, "case": 1, "param_bias": 0.0, "seed": 125, "num_windows": num_test_windows})
+    test_cs4_cfg = Lorenz63Config(**{**base, "case": 2, "param_bias": 0.15, "forcing_state_bias": 0.15, "seed": 126, "num_windows": num_test_windows})
 
-    return {
+    out = {
         "train_cs1": Lorenz63Dataset(train_cs1_cfg),
         "train_cs2": Lorenz63Dataset(train_cs2_cfg),
         "val_cs1": Lorenz63Dataset(val_cs1_cfg),
@@ -230,3 +235,7 @@ def make_mixed_datasets(cfg: Lorenz63Config, *,
         "test_cs1": Lorenz63Dataset(test_cs1_cfg),
         "test_cs2": Lorenz63Dataset(test_cs2_cfg),
     }
+    if include_randparam_test:
+        out["test_cs3"] = RandomParamLorenz63Dataset(test_cs3_cfg, param_noise=param_noise)
+        out["test_cs4"] = RandomParamLorenz63Dataset(test_cs4_cfg, param_noise=param_noise)
+    return out

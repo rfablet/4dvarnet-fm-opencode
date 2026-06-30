@@ -33,6 +33,8 @@ class DataConfig:
     train_mix: str = "cs1+cs2"
     randomize_params: bool = False
     param_noise: float = 0.2
+    test_randparam: bool = True
+    test_param_noise: float = 0.2
 
     @property
     def num_steps(self) -> int:

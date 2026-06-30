@@ -177,6 +177,8 @@ def main(cfg: DictConfig):
         num_train_windows=dc.get("num_train_windows", 1000),
         num_val_windows=dc.get("num_val_windows", 100),
         num_test_windows=dc.get("num_test_windows", 200),
+        include_randparam_test=dc.get("test_randparam", True),
+        param_noise=dc.get("test_param_noise", 0.2),
     )
     loaders = make_experiment_dataloaders(
         datasets, batch_size=cfg.training.batch_size,
@@ -231,17 +233,34 @@ def main(cfg: DictConfig):
     model.to(device)
     model.eval()
     t0 = time.time()
-    m1, s1 = evaluate_model(model, datasets["test_cs1"], device, model_type)
-    m2, s2 = evaluate_model(model, datasets["test_cs2"], device, model_type)
+    test_keys = ["test_cs1", "test_cs2", "test_cs3", "test_cs4"]
+    results_metrics = {}
+    for key in test_keys:
+        if key in datasets:
+            m, s = evaluate_model(model, datasets[key], device, model_type)
+            results_metrics[key] = (m, s)
     eval_t = time.time() - t0
 
     # Save trajectories
-    save_trajectories(model, datasets["test_cs1"], device, model_type,
-                      os.path.join(exp_dir, "trajectories_cs1.npz"))
-    save_trajectories(model, datasets["test_cs2"], device, model_type,
-                      os.path.join(exp_dir, "trajectories_cs2.npz"))
+    for key in test_keys:
+        if key in datasets:
+            case = key.replace("test_", "")
+            save_trajectories(model, datasets[key], device, model_type,
+                              os.path.join(exp_dir, f"trajectories_{case}.npz"))
 
-    deg = float(np.mean(m2) / (np.mean(m1) + 1e-10))
+    def _rmse_entry(m, s):
+        return {
+            "X": {"mean": float(m[0]), "std": float(s[0])},
+            "Y": {"mean": float(m[1]), "std": float(s[1])},
+            "Z": {"mean": float(m[2]), "std": float(s[2])},
+            "mean": float(np.mean(m)),
+        }
+
+    cs1 = results_metrics.get("test_cs1")
+    cs2 = results_metrics.get("test_cs2")
+    cs3 = results_metrics.get("test_cs3")
+    cs4 = results_metrics.get("test_cs4")
+
     result = {
         "experiment_id": exp_id,
         "model_type": model_type,
@@ -256,27 +275,37 @@ def main(cfg: DictConfig):
         "total_time_seconds": total_t,
         "train_time_seconds": train_time,
         "eval_time_seconds": eval_t,
-        "fm_cs1": {
-            "X": {"mean": float(m1[0]), "std": float(s1[0])},
-            "Y": {"mean": float(m1[1]), "std": float(s1[1])},
-            "Z": {"mean": float(m1[2]), "std": float(s1[2])},
-            "mean": float(np.mean(m1)),
-        },
-        "fm_cs2": {
-            "X": {"mean": float(m2[0]), "std": float(s2[0])},
-            "Y": {"mean": float(m2[1]), "std": float(s2[1])},
-            "Z": {"mean": float(m2[2]), "std": float(s2[2])},
-            "mean": float(np.mean(m2)),
-        },
-        "fm_degradation": deg,
     }
+    if cs1:
+        result["fm_cs1"] = _rmse_entry(*cs1)
+    if cs2:
+        result["fm_cs2"] = _rmse_entry(*cs2)
+    if cs3:
+        result["fm_cs3"] = _rmse_entry(*cs3)
+    if cs4:
+        result["fm_cs4"] = _rmse_entry(*cs4)
+    if cs1 and cs2:
+        result["fm_degradation"] = float(np.mean(cs2[0]) / (np.mean(cs1[0]) + 1e-10))
+    if cs3 and cs4:
+        result["fm_degradation_cs3cs4"] = float(np.mean(cs4[0]) / (np.mean(cs3[0]) + 1e-10))
+
     with open(results_path, "w") as f:
         json.dump(result, f, indent=2)
 
     print(f"\n  ── Results ─────────────────────────────────")
-    print(f"  CS1: X={m1[0]:.4f} Y={m1[1]:.4f} Z={m1[2]:.4f}  mean={np.mean(m1):.4f}")
-    print(f"  CS2: X={m2[0]:.4f} Y={m2[1]:.4f} Z={m2[2]:.4f}  mean={np.mean(m2):.4f}")
-    print(f"  Degradation: {deg:.2f}x  |  Total: {total_t:.0f}s")
+    if cs1:
+        m1, s1 = cs1
+        print(f"  CS1: X={m1[0]:.4f} Y={m1[1]:.4f} Z={m1[2]:.4f}  mean={np.mean(m1):.4f}")
+    if cs2:
+        m2, s2 = cs2
+        print(f"  CS2: X={m2[0]:.4f} Y={m2[1]:.4f} Z={m2[2]:.4f}  mean={np.mean(m2):.4f}")
+    if cs3:
+        m3, s3 = cs3
+        print(f"  CS3: X={m3[0]:.4f} Y={m3[1]:.4f} Z={m3[2]:.4f}  mean={np.mean(m3):.4f}")
+    if cs4:
+        m4, s4 = cs4
+        print(f"  CS4: X={m4[0]:.4f} Y={m4[1]:.4f} Z={m4[2]:.4f}  mean={np.mean(m4):.4f}")
+    print(f"  Total: {total_t:.0f}s")
 
 
 if __name__ == "__main__":
