@@ -18,3 +18,4 @@ training:
 data:
   train_mix: cs1+cs2
   randomize_params: false
+  test_randparam: false

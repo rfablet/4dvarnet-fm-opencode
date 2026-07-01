@@ -22,3 +22,4 @@ training:
 data:
   train_mix: cs1_rand+cs2_rand
   randomize_params: true
+  test_randparam: false
