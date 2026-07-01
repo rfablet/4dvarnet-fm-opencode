@@ -11,7 +11,7 @@ model:
     N_outer: 10
     sigma_prior: 0.5
     dropout: 0.1
-    train_tau_0_only: false
+    train_tau_0_only: true
 training:
   stage1:
     epochs: 400

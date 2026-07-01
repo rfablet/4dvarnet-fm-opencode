@@ -6,7 +6,7 @@
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
 #SBATCH --job-name=4dvarnet-1epoch
-#SBATCH --array=0-5%2
+#SBATCH --array=0-8%3
 #SBATCH --output=sbatch_logs/one_epoch_%j_%a.out
 #SBATCH --error=sbatch_logs/one_epoch_%j_%a.err
 
@@ -27,6 +27,9 @@ EXPERIMENTS=(
   F1_vanilla_cfm_default
   F2_vanilla_cfm_small
   F3_vanilla_cfm_rand
+  G1_vanilla_cfm_t0_default
+  G2_vanilla_cfm_t0_small
+  G3_vanilla_cfm_t0_rand
 )
 EXP=${EXPERIMENTS[$SLURM_ARRAY_TASK_ID]}
 

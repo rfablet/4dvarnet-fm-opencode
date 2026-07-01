@@ -6,12 +6,12 @@ defaults:
 model:
   model_type: vanilla_cfm
   vanilla_cfm:
-    hidden_channels: [64, 128, 256]
+    hidden_channels: [32, 64, 128]
     time_emb_dim: 64
     N_outer: 10
     sigma_prior: 0.5
     dropout: 0.1
-    train_tau_0_only: false
+    train_tau_0_only: true
 training:
   stage1:
     epochs: 400
@@ -20,5 +20,5 @@ training:
   stage2:
     epochs: 0
 data:
-  train_mix: cs1+cs2
-  randomize_params: false
+  train_mix: cs1_rand+cs2_rand
+  randomize_params: true

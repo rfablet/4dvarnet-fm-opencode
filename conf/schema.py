@@ -91,6 +91,7 @@ class VanillaCFMConfig:
     N_outer: int = 10
     sigma_prior: float = 0.5
     dropout: float = 0.1
+    train_tau_0_only: bool = False
 
 
 @dataclass

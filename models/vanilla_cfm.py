@@ -6,7 +6,7 @@ from models.interpolant import LinearInterpolant
 
 
 class VanillaCFM(nn.Module):
-    def __init__(self, state_dim=3, hidden_channels=None, time_emb_dim=64, N_outer=10, sigma_prior=0.5, dropout=0.1):
+    def __init__(self, state_dim=3, hidden_channels=None, time_emb_dim=64, N_outer=10, sigma_prior=0.5, dropout=0.1, train_tau_0_only=False):
         super().__init__()
         self.unet = UNet1D(
             state_dim=state_dim,
@@ -20,6 +20,7 @@ class VanillaCFM(nn.Module):
         self.N_outer = N_outer
         self.sigma_prior = sigma_prior
         self.state_dim = state_dim
+        self.train_tau_0_only = train_tau_0_only
 
     def forward(self, x_t, obs, tau):
         B, T, D = x_t.shape
@@ -29,7 +30,10 @@ class VanillaCFM(nn.Module):
     def compute_cfm_loss(self, batch):
         B = batch.obs.shape[0]
         device = batch.obs.device
-        tau = torch.rand(B, device=device)
+        if self.train_tau_0_only:
+            tau = torch.zeros(B, device=device)
+        else:
+            tau = torch.rand(B, device=device)
         x0 = torch.randn_like(batch.states) * self.sigma_prior
         x_tau = self.interpolant.mix(x0, batch.states, tau)
         v_target = batch.states - x0
@@ -37,6 +41,13 @@ class VanillaCFM(nn.Module):
         return F.mse_loss(v_pred, v_target)
 
     def sample(self, obs, N_outer=None):
+        if self.train_tau_0_only:
+            B, T, D = obs.shape
+            device = obs.device
+            x = torch.randn_like(obs) * self.sigma_prior
+            tau = torch.zeros(B, device=device)
+            v = self.forward(x, obs, tau)
+            return x + v
         if N_outer is None:
             N_outer = self.N_outer
         B, T, D = obs.shape

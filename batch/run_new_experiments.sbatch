@@ -4,9 +4,9 @@
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=4dvarnet-new-exp
-#SBATCH --array=0-5
+#SBATCH --array=0-8%3
 #SBATCH --output=sbatch_logs/new_exp_%j_%a.out
 #SBATCH --error=sbatch_logs/new_exp_%j_%a.err
 
@@ -25,6 +25,9 @@ EXPERIMENTS=(
   F1_vanilla_cfm_default
   F2_vanilla_cfm_small
   F3_vanilla_cfm_rand
+  G1_vanilla_cfm_t0_default
+  G2_vanilla_cfm_t0_small
+  G3_vanilla_cfm_t0_rand
 )
 EXP=${EXPERIMENTS[$SLURM_ARRAY_TASK_ID]}
 
