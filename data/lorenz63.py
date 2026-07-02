@@ -239,3 +239,20 @@ def make_mixed_datasets(cfg: Lorenz63Config, *,
         out["test_cs3"] = RandomParamLorenz63Dataset(test_cs3_cfg, param_noise=param_noise)
         out["test_cs4"] = RandomParamLorenz63Dataset(test_cs4_cfg, param_noise=param_noise)
     return out
+
+
+def make_bias_ablation_dataset(base_cfg: Lorenz63Config, param_bias: float,
+                          forcing_state_bias: float, forcing_coupling: str = "quartic",
+                          num_windows: int = 200, seed: int = 200) -> Lorenz63Dataset:
+    """Build a single case=2 (corrupted-forcing) dataset for a given
+    (param_bias, forcing_state_bias) pair. Independent of make_mixed_datasets:
+    CS1-CS4 always keep their fixed bias values regardless of these arguments.
+    """
+    base = base_cfg.__dict__.copy()
+    ablation_cfg = Lorenz63Config(**{
+        **base, "case": 2, "param_bias": param_bias,
+        "forcing_state_bias": forcing_state_bias,
+        "forcing_coupling": forcing_coupling,
+        "seed": seed, "num_windows": num_windows,
+    })
+    return Lorenz63Dataset(ablation_cfg)
