@@ -83,10 +83,19 @@ class ConditionEncoder(nn.Module):
             proj_in += state_dim * 3
         self.proj = nn.Linear(proj_in, hidden_dim) if proj_in != hidden_dim else nn.Identity()
 
-    def forward(self, x: torch.Tensor, obs: torch.Tensor, energy_terms: list = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        obs: torch.Tensor,
+        obs_mask: torch.Tensor = None,
+        energy_terms: list = None,
+    ) -> torch.Tensor:
         B, C, L = x.shape
         cond = x
         if self.use_obs:
+            if obs_mask is not None:
+                mask_channel = obs_mask.reshape(B, 1, L).to(dtype=obs.dtype, device=obs.device)
+                obs = obs * mask_channel  # hard-zero regardless of what obs holds there
             cond = torch.cat([cond, obs], dim=1)
         if self.use_energy and energy_terms is not None:
             for term in energy_terms:
@@ -148,6 +157,7 @@ class UNet1D(nn.Module):
         self,
         x: torch.Tensor,
         obs: torch.Tensor = None,
+        obs_mask: torch.Tensor = None,
         x_tau: torch.Tensor = None,
         tau: torch.Tensor = None,
         energy_terms: list = None,
@@ -158,7 +168,7 @@ class UNet1D(nn.Module):
         if tau is not None:
             t_emb = self.time_embed(tau)
 
-        cond = self.cond_encoder(x, obs, energy_terms)
+        cond = self.cond_encoder(x, obs, obs_mask=obs_mask, energy_terms=energy_terms)
         h = self.enc_in(cond)
 
         skips = []

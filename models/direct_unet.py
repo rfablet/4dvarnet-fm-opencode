@@ -18,9 +18,9 @@ class DirectUNet(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, obs):
+    def forward(self, obs, obs_mask=None):
         B, T, D = obs.shape
         x = torch.zeros(B, D, T, device=obs.device)
         tau = torch.zeros(B, device=obs.device)
-        out = self.unet(x, obs.transpose(1, 2), tau=tau)
+        out = self.unet(x, obs.transpose(1, 2), obs_mask=obs_mask, tau=tau)
         return out.transpose(1, 2)

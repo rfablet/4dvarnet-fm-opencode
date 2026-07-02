@@ -16,7 +16,8 @@ def evaluate_model(model, dataset, device):
     for i in range(len(dataset)):
         w = dataset[i]
         obs = w["obs"].unsqueeze(0).to(device)
-        pred = model(obs).detach().cpu().numpy()[0]
+        obs_mask = w["obs_mask"].unsqueeze(0).to(device)
+        pred = model(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         truth = w["true_state"].numpy()
         rmse_list.append(rmse(pred, truth))
     all_rmse = np.stack(rmse_list, axis=0)

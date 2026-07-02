@@ -21,9 +21,9 @@ class VanillaCFM(nn.Module):
         self.sigma_prior = sigma_prior
         self.state_dim = state_dim
 
-    def forward(self, x_t, obs, tau):
+    def forward(self, x_t, obs, tau, obs_mask=None):
         B, T, D = x_t.shape
-        v = self.unet(x_t.transpose(1, 2), obs.transpose(1, 2), tau=tau)
+        v = self.unet(x_t.transpose(1, 2), obs.transpose(1, 2), obs_mask=obs_mask, tau=tau)
         return v.transpose(1, 2)
 
     def compute_cfm_loss(self, batch):
@@ -33,10 +33,10 @@ class VanillaCFM(nn.Module):
         x0 = torch.randn_like(batch.states) * self.sigma_prior
         x_tau = self.interpolant.mix(x0, batch.states, tau)
         v_target = batch.states - x0
-        v_pred = self.forward(x_tau, batch.obs, tau)
+        v_pred = self.forward(x_tau, batch.obs, tau, obs_mask=batch.obs_mask)
         return F.mse_loss(v_pred, v_target)
 
-    def sample(self, obs, N_outer=None):
+    def sample(self, obs, obs_mask=None, N_outer=None):
         if N_outer is None:
             N_outer = self.N_outer
         B, T, D = obs.shape
@@ -45,6 +45,6 @@ class VanillaCFM(nn.Module):
         x = torch.randn_like(obs) * self.sigma_prior
         for step in range(N_outer):
             tau = torch.full((B,), step / N_outer, device=device)
-            v = self.forward(x, obs, tau)
+            v = self.forward(x, obs, tau, obs_mask=obs_mask)
             x = x + dt * v
         return x

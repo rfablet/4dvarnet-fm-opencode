@@ -40,12 +40,13 @@ class TweedieSolver(nn.Module):
             dropout=dropout,
         )
 
-    def estimate_mean(self, obs: torch.Tensor) -> torch.Tensor:
+    def estimate_mean(self, obs: torch.Tensor, obs_mask: torch.Tensor = None) -> torch.Tensor:
         B, T, D = obs.shape
         x = torch.zeros(B, D, T, device=obs.device)
         for k in range(self.K_inner):
-            tau = torch.full((B,), k / (self.K_inner - 1), device=obs.device)
-            residual = self.mean_estimator(x, obs.transpose(1, 2), tau)
+            tau_val = k / (self.K_inner - 1) if self.K_inner > 1 else 0.0
+            tau = torch.full((B,), tau_val, device=obs.device)
+            residual = self.mean_estimator(x, obs.transpose(1, 2), tau, obs_mask=obs_mask)
             x = x + residual
         return x.transpose(1, 2)
 
@@ -87,6 +88,7 @@ class TweedieSolver(nn.Module):
     def forward(
         self,
         obs: torch.Tensor,
+        obs_mask: torch.Tensor = None,
         obs_operator: callable = None,
         prior_operator: callable = None,
         device: torch.device = None,
@@ -95,7 +97,7 @@ class TweedieSolver(nn.Module):
         if device is None:
             device = obs.device
 
-        x_mean = self.estimate_mean(obs)
+        x_mean = self.estimate_mean(obs, obs_mask=obs_mask)
 
         x0 = torch.randn(B, T, D, device=device) * 0.5
         x = x0.clone()
@@ -115,7 +117,7 @@ class TweedieSolver(nn.Module):
             blended = (1 - K) * x_mean + K * x
 
             for k in range(1, self.K_inner + 1):
-                tau_k = (n - 1 + k) / self.N_outer / self.K_inner
+                tau_k = ((n - 1) * self.K_inner + k) / (self.N_outer * self.K_inner)
                 tau_k = torch.full((B,), tau_k, device=device)
 
                 ng_pre = self.interpolant.ng_prefactor(tau_k)
@@ -128,7 +130,7 @@ class TweedieSolver(nn.Module):
                 )
                 residual = self.non_gaussian(
                     blended.transpose(1, 2), obs.transpose(1, 2), x.transpose(1, 2),
-                    tau_k, y_diff=eps[0], phi_diff=eps[1], bg_diff=eps[2],
+                    tau_k, obs_mask=obs_mask, y_diff=eps[0], phi_diff=eps[1], bg_diff=eps[2],
                 )
                 blended = blended + ng_pre * residual.transpose(1, 2)
 

@@ -58,12 +58,12 @@ class LitModel(pl.LightningModule):
     def _forward_and_loss(self, batch):
         if self.model_type == "tweedie":
             if self.stage == 1:
-                pred = self.model.estimate_mean(batch.obs)
+                pred = self.model.estimate_mean(batch.obs, obs_mask=batch.obs_mask)
             else:
-                pred = self.model(batch.obs)
+                pred = self.model(batch.obs, obs_mask=batch.obs_mask)
             loss = self.loss_fn(pred, batch.states)
         elif self.model_type == "direct_unet":
-            pred = self.model(batch.obs)
+            pred = self.model(batch.obs, obs_mask=batch.obs_mask)
             loss = self.loss_fn(pred, batch.states)
         elif self.model_type == "vanilla_cfm":
             loss = self.model.compute_cfm_loss(batch)

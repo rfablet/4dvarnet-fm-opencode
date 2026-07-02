@@ -107,10 +107,11 @@ def evaluate_model(model, dataset, device, use_mean_estimator=False):
     for i in range(len(dataset)):
         w = dataset[i]
         obs = w["obs"].unsqueeze(0).to(device)
+        obs_mask = w["obs_mask"].unsqueeze(0).to(device)
         if use_mean_estimator:
-            pred = model.estimate_mean(obs).detach().cpu().numpy()[0]
+            pred = model.estimate_mean(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         else:
-            pred = model(obs).detach().cpu().numpy()[0]
+            pred = model(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         truth = w["true_state"].numpy()
         rmse_list.append(rmse(pred, truth))
     all_rmse = np.stack(rmse_list, axis=0)

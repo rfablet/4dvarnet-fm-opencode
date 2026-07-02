@@ -36,6 +36,7 @@ class IterativeUpdateCell(nn.Module):
         obs: torch.Tensor,
         x_tau: torch.Tensor,
         tau: torch.Tensor,
+        obs_mask: torch.Tensor = None,
         y_diff: torch.Tensor = None,
         phi_diff: torch.Tensor = None,
         bg_diff: torch.Tensor = None,
@@ -56,7 +57,7 @@ class IterativeUpdateCell(nn.Module):
             else:
                 energy_terms.append(torch.zeros_like(x))
 
-        residual = self.net(x=x, obs=obs, x_tau=x_tau, tau=tau, energy_terms=energy_terms)
+        residual = self.net(x=x, obs=obs, obs_mask=obs_mask, x_tau=x_tau, tau=tau, energy_terms=energy_terms)
         return residual
 
 
@@ -79,5 +80,5 @@ class MeanEstimatorCell(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, obs: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-        return self.net(x=x, obs=obs, tau=tau)
+    def forward(self, x: torch.Tensor, obs: torch.Tensor, tau: torch.Tensor, obs_mask: torch.Tensor = None) -> torch.Tensor:
+        return self.net(x=x, obs=obs, obs_mask=obs_mask, tau=tau)

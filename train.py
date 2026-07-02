@@ -100,12 +100,13 @@ def evaluate_model(model, dataset, device, model_type="tweedie"):
     for i in range(len(dataset)):
         w = dataset[i]
         obs = w["obs"].unsqueeze(0).to(device)
+        obs_mask = w["obs_mask"].unsqueeze(0).to(device)
         if model_type == "tweedie":
-            pred = model(obs).detach().cpu().numpy()[0]
+            pred = model(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         elif model_type == "direct_unet":
-            pred = model(obs).detach().cpu().numpy()[0]
+            pred = model(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         elif model_type == "vanilla_cfm":
-            pred = model.sample(obs).detach().cpu().numpy()[0]
+            pred = model.sample(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         truth = w["true_state"].numpy()
         rmse_list.append(rmse(pred, truth))
     all_rmse = np.stack(rmse_list, axis=0)
@@ -117,12 +118,13 @@ def save_trajectories(model, dataset, device, model_type, save_path):
     for i in range(len(dataset)):
         w = dataset[i]
         obs = w["obs"].unsqueeze(0).to(device)
+        obs_mask = w["obs_mask"].unsqueeze(0).to(device)
         if model_type == "tweedie":
-            pred = model(obs).detach().cpu().numpy()[0]
+            pred = model(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         elif model_type == "direct_unet":
-            pred = model(obs).detach().cpu().numpy()[0]
+            pred = model(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         elif model_type == "vanilla_cfm":
-            pred = model.sample(obs).detach().cpu().numpy()[0]
+            pred = model.sample(obs, obs_mask=obs_mask).detach().cpu().numpy()[0]
         trajs.append(pred)
         truths.append(w["true_state"].numpy())
     np.savez_compressed(save_path,

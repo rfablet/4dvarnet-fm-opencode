@@ -28,7 +28,7 @@ def train_stage1(
             B, T, D = batch.states.shape
 
             optimizer.zero_grad()
-            pred_mean = model.estimate_mean(batch.obs)
+            pred_mean = model.estimate_mean(batch.obs, obs_mask=batch.obs_mask)
             loss = loss_fn(pred_mean, batch.states)
             loss.backward()
             optimizer.step()
@@ -39,7 +39,7 @@ def train_stage1(
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                pred_mean = model.estimate_mean(batch.obs)
+                pred_mean = model.estimate_mean(batch.obs, obs_mask=batch.obs_mask)
                 loss = loss_fn(pred_mean, batch.states)
                 val_loss += loss.item()
 
