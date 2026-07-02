@@ -172,14 +172,23 @@ def main(cfg: DictConfig):
         forcing_state_bias=dc.get("forcing_state_bias", 0.0),
         forcing_coupling=dc.get("forcing_coupling", "linear"),
     )
-    datasets = make_mixed_datasets(
-        base_cfg,
-        num_train_windows=dc.get("num_train_windows", 1000),
-        num_val_windows=dc.get("num_val_windows", 100),
-        num_test_windows=dc.get("num_test_windows", 200),
-        include_randparam_test=dc.get("test_randparam", True),
-        param_noise=dc.get("test_param_noise", 0.2),
-    )
+    datasets_cache = os.path.join(EXP_DIR, "datasets.pt")
+    if os.path.exists(datasets_cache):
+        t0 = time.time()
+        datasets = torch.load(datasets_cache, weights_only=False)
+        print(f"  Loaded cached datasets in {time.time()-t0:.1f}s")
+    else:
+        t0 = time.time()
+        datasets = make_mixed_datasets(
+            base_cfg,
+            num_train_windows=dc.get("num_train_windows", 1000),
+            num_val_windows=dc.get("num_val_windows", 100),
+            num_test_windows=dc.get("num_test_windows", 200),
+            include_randparam_test=dc.get("test_randparam", True),
+            param_noise=dc.get("test_param_noise", 0.2),
+        )
+        print(f"  Datasets generated in {time.time()-t0:.1f}s")
+        torch.save(datasets, datasets_cache)
     loaders = make_experiment_dataloaders(
         datasets, batch_size=cfg.training.batch_size,
         train_mix=train_mix, num_workers=4,
