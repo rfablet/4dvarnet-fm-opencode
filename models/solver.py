@@ -59,6 +59,7 @@ class TweedieSolver(nn.Module):
         obs_operator: callable = None,
         prior_operator: callable = None,
         nu: float = 1.0,
+        obs_mask: torch.Tensor = None,
     ) -> list:
         B, D, T = x.shape
         device = x.device
@@ -70,6 +71,9 @@ class TweedieSolver(nn.Module):
                 y_diff = obs.transpose(1, 2) - y_pred
             else:
                 y_diff = obs[:, :T] - x
+            if obs_mask is not None:
+                mask_channel = obs_mask.reshape(B, 1, T).to(dtype=y_diff.dtype, device=y_diff.device)
+                y_diff = y_diff * mask_channel  # hard-zero at unobserved steps, obs holds true state there
 
         phi_diff = torch.zeros(B, D, T, device=device)
         if prior_operator is not None:
@@ -127,6 +131,7 @@ class TweedieSolver(nn.Module):
                 eps = self.energy_terms(
                     blended.transpose(1, 2), obs, x.transpose(1, 2),
                     tau_k, obs_operator, prior_operator,
+                    obs_mask=obs_mask,
                 )
                 residual = self.non_gaussian(
                     blended.transpose(1, 2), obs.transpose(1, 2), x.transpose(1, 2),
