@@ -15,6 +15,7 @@ class LitModel(pl.LightningModule):
         gradient_clip_val: float = 10.0,
         use_gradient_loss: bool = True,
         gradient_weight: float = 0.1,
+        max_epochs: int = 100,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -23,6 +24,7 @@ class LitModel(pl.LightningModule):
         self.stage = stage
         self.lr = lr
         self.gradient_clip_val = gradient_clip_val
+        self.max_epochs = max_epochs
         self.loss_fn = StateMSELoss(
             use_gradient_loss=use_gradient_loss,
             gradient_weight=gradient_weight,
@@ -37,7 +39,11 @@ class LitModel(pl.LightningModule):
                 params = self.model.non_gaussian.parameters()
         else:
             params = self.model.parameters()
-        return torch.optim.Adam(params, lr=self.lr)
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.max_epochs, eta_min=self.lr * 0.01
+        )
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def on_train_start(self):
         if self._frozen:

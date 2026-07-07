@@ -5,7 +5,7 @@ Supports TweedieSolver, DirectUNet, and VanillaCFM models.
 
 Usage:
     python train.py                                               # defaults (TweedieSolver)
-    python train.py --config-name experiment/E1_direct_unet_default  # experiment preset
+    python train.py --config-name experiment/E1_direct_unet_default_cs2  # experiment preset
 """
 import os, sys, json, time
 import torch
@@ -47,8 +47,8 @@ def make_experiment_dataloaders(datasets, batch_size=32, train_mix="cs1+cs2",
     else:
         train_sources = {
             "cs1+cs2": [datasets["train_cs1"], datasets["train_cs2"]],
-            "cs1_only": [datasets["train_cs1"]],
-            "cs2_only": [datasets["train_cs2"]],
+            "cs1": [datasets["train_cs1"]],
+            "cs2": [datasets["train_cs2"]],
         }
     sources = train_sources.get(train_mix, next(iter(train_sources.values())))
     return {
@@ -223,7 +223,8 @@ def main(cfg: DictConfig):
                 lit = LitModel(model, model_type=model_type, stage=1,
                                lr=stage_cfg.lr, gradient_clip_val=stage_cfg.gradient_clip_val,
                                use_gradient_loss=cfg.training.loss.use_gradient,
-                               gradient_weight=cfg.training.loss.gradient_weight)
+                               gradient_weight=cfg.training.loss.gradient_weight,
+                               max_epochs=stage_cfg.epochs)
                 trainer = create_trainer(cfg, 1)
                 trainer.fit(lit, loaders["train"], loaders["val"])
                 path = cfg.paths.checkpoint_stage1

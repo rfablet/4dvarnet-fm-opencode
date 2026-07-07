@@ -45,6 +45,7 @@ def train_stage(
         gradient_clip_val=stage_cfg.gradient_clip_val,
         use_gradient_loss=cfg.training.loss.use_gradient,
         gradient_weight=cfg.training.loss.gradient_weight,
+        max_epochs=stage_cfg.epochs,
     )
     trainer = create_trainer(cfg, stage)
     trainer.fit(lit_module, loaders["train"], loaders["val"])
