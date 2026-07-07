@@ -33,7 +33,7 @@ model:
   N_outer: 10
   nu: 1.0
   use_obs: true
-  use_energy: true
+  use_energy: false
   dropout: 0.1
 
 training:
@@ -47,7 +47,7 @@ training:
     gradient_clip_val: 1.0
   batch_size: 32
   loss:
-    use_gradient: true
+    use_gradient: false
     gradient_weight: 0.1
 
 paths:
