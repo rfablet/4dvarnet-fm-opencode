@@ -1,5 +1,4 @@
 """Tests for TweedieSolver."""
-import pytest
 import torch
 from models.solver import TweedieSolver
 
@@ -26,6 +25,15 @@ def test_estimate_mean_deterministic():
         out1 = model.estimate_mean(obs)
         out2 = model.estimate_mean(obs)
     torch.testing.assert_close(out1, out2)
+
+
+def test_estimate_mean_kinner1_no_div_by_zero():
+    # K_inner=1 must not divide by (K_inner - 1) = 0 in estimate_mean.
+    model = TweedieSolver(state_dim=3, hidden_channels=[4, 8], K_inner=1, N_outer=2)
+    obs = torch.randn(2, 50, 3)
+    out = model.estimate_mean(obs)
+    assert out.shape == (2, 50, 3)
+    assert torch.isfinite(out).all()
 
 
 def test_energy_terms_shape():

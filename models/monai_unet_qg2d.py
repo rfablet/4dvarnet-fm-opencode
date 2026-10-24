@@ -1,0 +1,594 @@
+"""MONAI-backed, circular-padded 2D DirectUNet for the QG case study.
+
+Same rationale as `models.monai_unet_adapter` (L96's `MonaiUNet1D`), but for
+QG's genuinely 2D, doubly-periodic (ny, nx) grid (see `models.qg_dynamics.
+QGDynamics`'s docstring: "double-periodic beta-plane channel") instead of
+L96's 1D ring. `models.direct_unet.DirectUNet` never applies a spatial
+convolution at all for QG -- it flattens the (ny, nx) field into a plain
+channel axis and only convolves along the time/day axis.
+
+Needs monai==1.6.0 / torch==2.8.0+cu126, which the project's default
+`fdv-monai-proto` env provides (see `models.monai_unet_adapter`'s docstring
+and AGENTS.md "Conda environment").
+
+Upstream gap patched here (not a MONAI config issue): `monai.networks.blocks.
+Convolution` builds its conv layer via the `Conv[Conv.CONV, spatial_dims]`
+factory with no `padding_mode` parameter anywhere in its own or
+`DiffusionModelUNet`'s public API -- every conv is hardcoded to zero-padding,
+which would leak/discard information across the domain's actual periodic
+boundary. We register a replacement "conv" factory function (MONAI's own
+public per-name-override mechanism, `LayerFactory.add_factory_callable` --
+not a private monkeypatch) that swaps in a `padding_mode="circular"`
+`nn.Conv2d` subclass for `spatial_dims=2`, and for `spatial_dims=3` an
+`nn.Conv3d` subclass periodic in its two spatial axes and zero-padded along the
+first (time) axis (the 3D QG prior, `MonaiSDAPrior3DQG`); dim 1 falls back to
+the stock `nn.Conv1d` unchanged, so this cannot affect L96's `MonaiUNet1D`
+(spatial_dims=1) sharing the same process.
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from models.interpolant import LinearInterpolant
+from models.vanilla_cfm import VanillaCFM
+
+_PATCHED_CIRCULAR_CONV2D = False
+
+
+class CircularConv2d(nn.Conv2d):
+    def __init__(self, *args, padding_mode: str = "circular", **kwargs):
+        super().__init__(*args, padding_mode=padding_mode, **kwargs)
+
+
+class SpaceCircularConv3d(nn.Conv3d):
+    """Conv3d over (time, ny, nx): circular padding in the two spatial axes (the doubly
+    periodic QG domain), zero padding along time (a window has real ends)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._space_pad = tuple(self.padding[1:])
+        self.padding = (self.padding[0], 0, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ph, pw = self._space_pad
+        if ph or pw:
+            x = F.pad(x, (pw, pw, ph, ph, 0, 0), mode="circular")
+        return super().forward(x)
+
+
+def _patch_conv2d_circular() -> None:
+    global _PATCHED_CIRCULAR_CONV2D
+    if _PATCHED_CIRCULAR_CONV2D:
+        return
+    from monai.networks.layers.factories import Conv
+
+    def _circular_conv_factory(dim: int):
+        types = (nn.Conv1d, CircularConv2d, SpaceCircularConv3d)
+        return types[dim - 1]
+
+    Conv.add_factory_callable("conv", _circular_conv_factory)
+    _PATCHED_CIRCULAR_CONV2D = True
+
+
+class MonaiUNet2DCircular(nn.Module):
+    """Doubly-periodic 2D backbone: MONAI's `DiffusionModelUNet` with every
+    conv circularly padded (see module docstring), attention disabled
+    (unneeded for a deterministic direct-regression head; also sidesteps the
+    same spatial_dims==1-only ResBlock temb-broadcast gap `MonaiUNet1D`
+    patches -- not applicable here, but attention reshape logic in this MONAI
+    version is likewise only exercised/tested for 2D/3D image use, so we
+    leave it off to keep this a minimal, well-tested conv-only backbone).
+
+    `forward(x, obs, tau)` mirrors `MonaiUNet1D`'s call shape, with `x`/`obs`
+    as (B, C, ny, nx) grids instead of (B, C, T).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 hidden_channels: list[int] | None = None,
+                 num_res_blocks: int = 2, norm_num_groups: int = 8,
+                 use_obs: bool = True, obs_channels: int | None = None):
+        super().__init__()
+        _patch_conv2d_circular()
+        from monai.networks.nets import DiffusionModelUNet
+
+        if hidden_channels is None:
+            hidden_channels = [64, 128, 256]
+        self.use_obs = use_obs
+        self.obs_channels = obs_channels if obs_channels is not None else in_channels
+        total_in = in_channels + (self.obs_channels if use_obs else 0)
+        self.backbone = DiffusionModelUNet(
+            spatial_dims=2,
+            in_channels=total_in,
+            out_channels=out_channels,
+            channels=tuple(hidden_channels),
+            attention_levels=tuple(False for _ in hidden_channels),
+            num_res_blocks=num_res_blocks,
+            norm_num_groups=norm_num_groups,
+        )
+
+    def forward(self, x: torch.Tensor, obs: torch.Tensor = None,
+                tau: torch.Tensor = None) -> torch.Tensor:
+        inp = x
+        if self.use_obs:
+            if obs is None:
+                raise ValueError("use_obs=True but obs is None")
+            inp = torch.cat([x, obs], dim=1)
+        B = x.shape[0]
+        timesteps = tau if tau is not None else torch.zeros(
+            B, device=x.device, dtype=x.dtype)
+        return self.backbone(inp, timesteps)
+
+
+class MonaiUNet2DQGSolver(nn.Module):
+    """QG-native backbone for `models.fourdvarnet.FourDVarNetSolver`
+    (`unet_backbone="monai2d"`): merges the T (days) axis into the *channel*
+    dimension (`T * channels_per_day` total input channels) instead of
+    `MonaiUNet1D`'s convention of treating T as a downsampled 1D-sequence
+    axis (which requires T divisible by the backbone's downsampling depth --
+    QG's 30-day windows often aren't, see `train_qg_neural.py`'s
+    `_pad_batch_for_monai1d`) or `MonaiDirectUNetQG`'s convention of folding
+    T into the *batch* dimension (every day processed fully independently,
+    no cross-day coupling at all). Here every day keeps its true `(ny, nx)`
+    circular-conv grid, and the 2D backbone's ordinary channel-mixing lets
+    it learn correlations across days too.
+
+    Drop-in for `MonaiUNet1D`/`UNet1D` at every `FourDVarNetSolver` call
+    site (`_build_backbone_unet`'s `use_obs=False` convention: FDV's own
+    channel-concat, e.g. `cat([x, obs], dim=-1)` for `update_input=
+    "obs+state"`, is already baked into the incoming channel axis before
+    this class ever sees it): `forward(x, tau=...)` takes `x` shaped
+    `(B, C, T)` (channel-first, sequence-last -- `MonaiUNet1D`'s own
+    convention) and returns the same `(B, C_out, T)` shape. `C` (`state_dim`/
+    `output_dim` at construction) must be a whole multiple of `ny*nx` --
+    `C // (ny*nx)` is the per-day channel count (e.g. `2*nlayers` for
+    `update_input="obs+state"`'s `state`+`obs` concatenation, matching QG's
+    `nlayers=2`-layer-major `D` layout exactly, the same one
+    `MonaiDirectUNetQG.forward` reshapes directly into `(nlayers, ny, nx)`).
+
+    `time_emb_dim` is accepted (for call-site parity with
+    `_build_backbone_unet`'s uniform kwargs) but ignored, same as
+    `MonaiUNet1D` -- MONAI's `DiffusionModelUNet` always carries its own
+    internal time embedding.
+    """
+
+    def __init__(self, state_dim: int, T: int, ny: int, nx: int,
+                 hidden_channels: list[int] | None = None,
+                 num_res_blocks: int = 2, norm_num_groups: int = 8,
+                 output_dim: int | None = None, dropout: float = 0.1,
+                 time_emb_dim: int = 0):
+        super().__init__()
+        if state_dim % (ny * nx) != 0:
+            raise ValueError(
+                f"state_dim ({state_dim}) must be a whole multiple of "
+                f"ny*nx ({ny}*{nx}={ny * nx}) for unet_backbone='monai2d'")
+        output_dim = output_dim if output_dim is not None else state_dim
+        if output_dim % (ny * nx) != 0:
+            raise ValueError(
+                f"output_dim ({output_dim}) must be a whole multiple of "
+                f"ny*nx ({ny}*{nx}={ny * nx}) for unet_backbone='monai2d'")
+        self.T = T
+        self.ny = ny
+        self.nx = nx
+        self.in_ch_per_day = state_dim // (ny * nx)
+        self.out_ch_per_day = output_dim // (ny * nx)
+        self.backbone2d = MonaiUNet2DCircular(
+            in_channels=T * self.in_ch_per_day, out_channels=T * self.out_ch_per_day,
+            hidden_channels=hidden_channels, num_res_blocks=num_res_blocks,
+            norm_num_groups=norm_num_groups, use_obs=False)
+        if dropout > 0:
+            from monai.networks.nets import diffusion_model_unet as _dmu
+            for module in self.backbone2d.backbone.modules():
+                if isinstance(module, _dmu.DiffusionUNetResnetBlock):
+                    module.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, obs: torch.Tensor = None,
+                tau: torch.Tensor = None) -> torch.Tensor:
+        B, C, T = x.shape
+        if T != self.T:
+            raise ValueError(f"expected T={self.T} (days), got {T}")
+        ch_per_day = C // (self.ny * self.nx)
+        # (B, C, T) -> (B, T, C) -> (B, T*ch_per_day, ny, nx): the day axis
+        # becomes additional channels, each day's C channels keep their
+        # true (ny, nx) grid layout.
+        x_grid = x.permute(0, 2, 1).reshape(B, T * ch_per_day, self.ny, self.nx)
+        out = self.backbone2d(x_grid, tau=tau)  # (B, T*out_ch_per_day, ny, nx)
+        out = out.reshape(B, T, self.out_ch_per_day * self.ny * self.nx)
+        return out.permute(0, 2, 1)  # (B, C_out, T)
+
+
+class MonaiDirectUNetQG(nn.Module):
+    """MONAI-backed circular DirectUNet for QG, drop-in for
+    `models.direct_unet.DirectUNet`.
+
+    Same `forward(batch) -> (B, T, D)` contract (`batch.obs`/`batch.forcing`/
+    `batch.params`/`batch.ic`, `D = nlayers*ny*nx` layer-major); each of the
+    `T` days is folded into the batch dim for the 2D backbone (matches the
+    existing per-day QG training loss -- no explicit temporal coupling
+    term). `ic_dim` (Q5) is broadcast identically across all `T` days
+    (one static field per window), unlike `forcing` (varies per day).
+    """
+
+    def __init__(self, ny: int, nx: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None,
+                 param_dim: int = 0, cond_extra_dim: int = 0, ic_dim: int = 0,
+                 num_res_blocks: int = 2, norm_num_groups: int = 8):
+        super().__init__()
+        self.ny = ny
+        self.nx = nx
+        self.nlayers = nlayers
+        self.state_dim = nlayers * ny * nx
+        self.param_dim = param_dim
+        self.cond_extra_dim = cond_extra_dim
+        self.ic_dim = ic_dim
+        # Zeroed "state" input placeholder + obs conditioning, matching
+        # MonaiDirectUNet/DirectUNet's convention (a CFM-architecture
+        # artifact carried over for direct deterministic regression -- the
+        # backbone's own use_obs branch does the actual channel concat).
+        self.unet = MonaiUNet2DCircular(
+            in_channels=nlayers, out_channels=nlayers,
+            hidden_channels=hidden_channels, num_res_blocks=num_res_blocks,
+            norm_num_groups=norm_num_groups, use_obs=True,
+            obs_channels=nlayers + cond_extra_dim + param_dim + ic_dim)
+
+    def forward(self, batch) -> torch.Tensor:
+        obs = batch.obs
+        B, T, D = obs.shape
+        obs_clean = torch.nan_to_num(obs, nan=0.0)
+        obs_grid = obs_clean.reshape(B * T, self.nlayers, self.ny, self.nx)
+        cond = [obs_grid]
+        if self.cond_extra_dim > 0:
+            # `batch.forcing` is a genuine (B, T, ny, nx) spatial field (the
+            # wind-curl forcing map, see data.qg_neural's Q3/Q4 conditioning
+            # docstring) -- reshape into cond_extra_dim (=1) channel(s), no
+            # spatial broadcast: unlike a scalar param, the forcing map's
+            # spatial structure (storm location) is exactly the physically
+            # meaningful signal.
+            forcing = batch.forcing.reshape(B * T, self.cond_extra_dim, self.ny, self.nx)
+            cond.append(forcing)
+        if self.param_dim > 0:
+            params_t = batch.params.unsqueeze(1).expand(B, T, -1).reshape(
+                B * T, self.param_dim, 1, 1).expand(-1, -1, self.ny, self.nx)
+            cond.append(params_t)
+        if self.ic_dim > 0:
+            # `batch.ic` (Q5) is one static (B, ic_dim*ny*nx) spatial field
+            # per WINDOW (the initial-condition snapshot, see
+            # data.qg_neural._ic_field) -- unlike `forcing` (varies per
+            # day), it's broadcast identically across all T days, not
+            # reshaped per-day.
+            ic_grid = batch.ic.reshape(B, self.ic_dim, self.ny, self.nx)
+            ic_t = ic_grid.unsqueeze(1).expand(B, T, -1, -1, -1).reshape(
+                B * T, self.ic_dim, self.ny, self.nx)
+            cond.append(ic_t)
+        cond = torch.cat(cond, dim=1) if len(cond) > 1 else cond[0]
+        x = torch.zeros(B * T, self.nlayers, self.ny, self.nx, device=obs.device)
+        tau = torch.zeros(B * T, device=obs.device)
+        out = self.unet(x, obs=cond, tau=tau)  # (B*T, nlayers, ny, nx)
+        return out.reshape(B, T, D)
+
+
+class MonaiDirectUNetQGChannelTime(nn.Module):
+    """DirectUNet-style single-pass QG estimator (like `MonaiDirectUNetQG`),
+    but merges the T (days) axis into the *channel* dimension via
+    `MonaiUNet2DQGSolver` instead of folding it into the *batch* dimension.
+    `MonaiDirectUNetQG` processes every day fully independently (no
+    cross-day coupling at all); this variant lets the single-pass
+    regression see cross-day context through the 2D backbone's ordinary
+    channel mixing, at the cost of a *fixed* `T` (the window length must
+    match what the model was constructed with -- unlike `MonaiDirectUNetQG`,
+    which tolerates any `T` since it never appears in a conv axis at all).
+
+    Same forcing/param/IC conditioning hooks as `MonaiDirectUNetQG`
+    (2026-09-14: `param_dim`/`cond_extra_dim`/`ic_dim`, all 0 by default --
+    the original obs-only behavior, matching Q1's `cond_mode="none"`, is
+    unchanged when none are set), so Q3/Q4/Q5-style conditioning ablations
+    can be retrained on this T-merged-into-channels backbone instead of
+    `MonaiDirectUNetQG`'s per-day-independent one. Every conditioning field
+    is folded into the same per-day channel block as the state placeholder
+    + obs (in that order: state, obs, forcing, params, ic) *before* T is
+    merged into channels, so the backbone's ordinary channel mixing can
+    relate a conditioning field on one day to the state/obs on another --
+    unlike `MonaiDirectUNetQG`, where each day's conditioning only ever
+    informs that same day's own independent forward pass. `forward(batch)
+    -> (B, T, D)`, same external contract as `MonaiDirectUNetQG`
+    (`batch.obs`/`batch.forcing`/`batch.params`/`batch.ic`).
+    """
+
+    def __init__(self, ny: int, nx: int, T: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None,
+                 param_dim: int = 0, cond_extra_dim: int = 0, ic_dim: int = 0,
+                 num_res_blocks: int = 2, norm_num_groups: int = 8,
+                 dropout: float = 0.1, use_obs_mask: bool = False):
+        super().__init__()
+        self.ny = ny
+        self.nx = nx
+        self.T = T
+        self.nlayers = nlayers
+        self.state_dim = nlayers * ny * nx
+        self.param_dim = param_dim
+        self.cond_extra_dim = cond_extra_dim
+        self.ic_dim = ic_dim
+        # `use_obs_mask` adds `batch.obs_mask` (per cell, same layout as obs)
+        # as `nlayers` extra channels per day: with a randomized observation
+        # density the zero-filled obs alone cannot tell an unobserved cell
+        # from an observed value at the normalized mean.
+        self.use_obs_mask = use_obs_mask
+        # Zeroed "state" input placeholder + obs (+ mask) + (optional) forcing/
+        # params/ic conditioning, matching MonaiDirectUNetQG's own
+        # convention -- concatenated along the per-day channel block
+        # before T is merged in.
+        in_ch_per_day = (2 * nlayers + (nlayers if use_obs_mask else 0)
+                         + cond_extra_dim + param_dim + ic_dim)
+        self.unet = MonaiUNet2DQGSolver(
+            state_dim=in_ch_per_day * ny * nx, T=T, ny=ny, nx=nx,
+            hidden_channels=hidden_channels, output_dim=self.state_dim,
+            dropout=dropout, norm_num_groups=norm_num_groups,
+            num_res_blocks=num_res_blocks)
+
+    def forward(self, batch) -> torch.Tensor:
+        obs = batch.obs
+        B, T, D = obs.shape
+        if T != self.T:
+            raise ValueError(f"expected T={self.T} (days), got {T}")
+        obs_clean = torch.nan_to_num(obs, nan=0.0)
+        x = torch.zeros_like(obs_clean)
+        cond = [x, obs_clean]
+        if self.use_obs_mask:
+            cond.append(batch.obs_mask.to(obs_clean.dtype))
+        if self.cond_extra_dim > 0:
+            # `batch.forcing` is (B, T, ny, nx) (cond_extra_dim=1 always in
+            # practice -- see MonaiDirectUNetQG.forward's own comment) --
+            # already the right per-day channel-major-then-spatial flat
+            # layout, no reshape beyond folding (ny, nx) into one axis.
+            cond.append(batch.forcing.reshape(B, T, self.cond_extra_dim * self.ny * self.nx))
+        if self.param_dim > 0:
+            # `batch.params` is one (B, param_dim) vector per WINDOW (not
+            # per day) -- broadcast across T days and tile each scalar
+            # param spatially into its own constant (ny, nx) channel,
+            # matching MonaiDirectUNetQG's own params_t convention.
+            cond.append(batch.params.view(B, 1, self.param_dim, 1).expand(
+                B, T, self.param_dim, self.ny * self.nx).reshape(
+                B, T, self.param_dim * self.ny * self.nx))
+        if self.ic_dim > 0:
+            # `batch.ic` (Q5) is one static (B, ic_dim*ny*nx) flat field per
+            # WINDOW -- broadcast identically across all T days, unlike
+            # forcing (varies per day) or params (a scalar vector).
+            cond.append(batch.ic.unsqueeze(1).expand(B, T, self.ic_dim * self.ny * self.nx))
+        inp = torch.cat(cond, dim=-1) if len(cond) > 1 else cond[0]
+        inp = inp.transpose(1, 2)  # (B, C, T)
+        out = self.unet(inp)  # (B, D, T)
+        return out.transpose(1, 2)  # (B, T, D)
+
+
+class MonaiVanillaCFMQGChannelTime(VanillaCFM):
+    """Generative obs-conditioned flow (`VanillaCFM`) on the T-merged-into-
+    channels QG backbone (`MonaiUNet2DQGSolver`), trained at random tau --
+    unlike the legacy QG `vanilla_cfm` row (UNet1D, tau = 0 only, a point
+    estimator). The velocity field sees, per day, the interpolated state
+    `x_tau`, the zero-filled obs and (optionally) the obs mask, all with T
+    merged into channels like `MonaiDirectUNetQGChannelTime`; tau goes to
+    the backbone's own time embedding. `compute_cfm_loss`/`sample` are
+    `VanillaCFM`'s (linear interpolant, v = x1 - x0, early-fine Euler grid);
+    `forward(x_tau, batch, tau) -> (B, T, D)`.
+    """
+
+    def __init__(self, ny: int, nx: int, T: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None, use_obs_mask: bool = True,
+                 N_outer: int = 20, sigma_prior: float = 0.5, dropout: float = 0.1,
+                 num_res_blocks: int = 2, norm_num_groups: int = 4):
+        nn.Module.__init__(self)
+        self.ny, self.nx, self.T, self.nlayers = ny, nx, T, nlayers
+        self.state_dim = nlayers * ny * nx
+        self.use_obs_mask = use_obs_mask
+        self.param_dim = 0
+        self.cond_extra_dim = 0
+        in_ch_per_day = 2 * nlayers + (nlayers if use_obs_mask else 0)
+        self.unet = MonaiUNet2DQGSolver(
+            state_dim=in_ch_per_day * ny * nx, T=T, ny=ny, nx=nx,
+            hidden_channels=hidden_channels, output_dim=self.state_dim,
+            dropout=dropout, norm_num_groups=norm_num_groups,
+            num_res_blocks=num_res_blocks)
+        self.interpolant = LinearInterpolant(nu=1.0)
+        self.N_outer = N_outer
+        self.sigma_prior = sigma_prior
+        self.train_tau_0_only = False
+
+    def forward(self, x_t: torch.Tensor, batch, tau: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x_t.shape
+        if T != self.T:
+            raise ValueError(f"expected T={self.T} (days), got {T}")
+        parts = [x_t, torch.nan_to_num(batch.obs, nan=0.0)]
+        if self.use_obs_mask:
+            parts.append(batch.obs_mask.to(x_t.dtype))
+        out = self.unet(torch.cat(parts, dim=-1).transpose(1, 2), tau=tau)
+        return out.transpose(1, 2)
+
+
+class MonaiSDAPriorQGChannelTime(VanillaCFM):
+    """Unconditional flow prior p(psi window) for score-based DA (SDA1) on the
+    T-merged-into-channels QG backbone: the QG counterpart of
+    `models.sda.UnconditionalPriorCFM`. Observations are never an input
+    (`batch.obs` is read only for its shape/device by `VanillaCFM.sample`);
+    they enter at sampling time through the guidance cost
+    (`evaluation/sda_sampler.py`). `forward(x_tau, batch, tau) -> (B, T, D)`.
+    """
+
+    def __init__(self, ny: int, nx: int, T: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None, N_outer: int = 10,
+                 sigma_prior: float = 0.5, dropout: float = 0.1,
+                 num_res_blocks: int = 2, norm_num_groups: int = 4):
+        nn.Module.__init__(self)
+        self.ny, self.nx, self.T, self.nlayers = ny, nx, T, nlayers
+        self.state_dim = nlayers * ny * nx
+        self.param_dim = 0
+        self.cond_extra_dim = 0
+        self.unet = MonaiUNet2DQGSolver(
+            state_dim=self.state_dim, T=T, ny=ny, nx=nx,
+            hidden_channels=hidden_channels, output_dim=self.state_dim,
+            dropout=dropout, norm_num_groups=norm_num_groups,
+            num_res_blocks=num_res_blocks)
+        self.interpolant = LinearInterpolant(nu=1.0)
+        self.N_outer = N_outer
+        self.sigma_prior = sigma_prior
+        self.train_tau_0_only = False
+
+    def forward(self, x_t: torch.Tensor, batch, tau: torch.Tensor) -> torch.Tensor:
+        if x_t.shape[1] != self.T:
+            raise ValueError(f"expected T={self.T} (days), got {x_t.shape[1]}")
+        return self.unet(x_t.transpose(1, 2), tau=tau).transpose(1, 2)
+
+
+class MonaiSDAPrior3DQG(VanillaCFM):
+    """Unconditional flow prior for SDA on a 3D backbone: MONAI's `DiffusionModelUNet` with
+    `spatial_dims=3` over (time, ny, nx), the two layers as channels -- unlike
+    `MonaiSDAPriorQGChannelTime`, which stacks the days into the channels of a 2D U-Net.
+    Convolutions are local in time and share their weights across days, so one network
+    runs on any window length: `T` is the training window (what `ComposedFlow` composes
+    over), and `any_length` lets the evaluation also run it on the full window directly.
+    Time is zero-padded at the end to a multiple of the backbone's downsampling factor and
+    the padded days are dropped from the output. `forward(x_tau, batch, tau) -> (B, T, D)`.
+    """
+
+    any_length = True
+
+    def __init__(self, ny: int, nx: int, T: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None, N_outer: int = 10,
+                 sigma_prior: float = 0.5, dropout: float = 0.1,
+                 num_res_blocks: int = 2, norm_num_groups: int = 8):
+        nn.Module.__init__(self)
+        _patch_conv2d_circular()
+        from monai.networks.nets import DiffusionModelUNet
+        from monai.networks.nets import diffusion_model_unet as _dmu
+
+        hidden_channels = list(hidden_channels or [32, 64, 128])
+        self.ny, self.nx, self.T, self.nlayers = ny, nx, T, nlayers
+        self.state_dim = nlayers * ny * nx
+        self.param_dim = 0
+        self.cond_extra_dim = 0
+        self.time_multiple = 2 ** (len(hidden_channels) - 1)
+        self.backbone = DiffusionModelUNet(
+            spatial_dims=3, in_channels=nlayers, out_channels=nlayers,
+            channels=tuple(hidden_channels),
+            attention_levels=tuple(False for _ in hidden_channels),
+            num_res_blocks=num_res_blocks, norm_num_groups=norm_num_groups)
+        if dropout > 0:
+            for module in self.backbone.modules():
+                if isinstance(module, _dmu.DiffusionUNetResnetBlock):
+                    module.dropout = nn.Dropout(dropout)
+        self.interpolant = LinearInterpolant(nu=1.0)
+        self.N_outer = N_outer
+        self.sigma_prior = sigma_prior
+        self.train_tau_0_only = False
+
+    def forward(self, x_t: torch.Tensor, batch, tau: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x_t.shape
+        x = x_t.reshape(b, t, self.nlayers, self.ny, self.nx).permute(0, 2, 1, 3, 4)
+        pad = -t % self.time_multiple
+        if pad:
+            x = F.pad(x, (0, 0, 0, 0, 0, pad))
+        v = self.backbone(x, tau)[:, :, :t]
+        return v.permute(0, 2, 1, 3, 4).reshape(b, t, self.state_dim)
+
+
+class MonaiVanillaCFM3DQG(VanillaCFM):
+    """Generative obs-conditioned flow (G2-3D) on the 3D backbone of `MonaiDirectUNet3DQG` /
+    `MonaiSDAPrior3DQG`: MONAI's `DiffusionModelUNet` with `spatial_dims=3` over (time, ny, nx),
+    whose 6 input channels are the interpolated state `x_tau`, the zero-filled obs and the obs
+    mask of both layers, and whose output is the 2-layer velocity; tau goes to the backbone's
+    time embedding. Periodic in space, zero-padded in time and shared across days, so it runs
+    on any window length (`any_length`); `T` is the training window. Time is zero-padded at
+    the end to a multiple of the downsampling factor, padded days dropped.
+    `compute_cfm_loss`/`sample` are `VanillaCFM`'s (linear interpolant, early-fine Euler grid);
+    `forward(x_tau, batch, tau) -> (B, T, D)`.
+    """
+
+    any_length = True
+
+    def __init__(self, ny: int, nx: int, T: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None, N_outer: int = 20,
+                 sigma_prior: float = 0.5, dropout: float = 0.1,
+                 num_res_blocks: int = 2, norm_num_groups: int = 8):
+        nn.Module.__init__(self)
+        _patch_conv2d_circular()
+        from monai.networks.nets import DiffusionModelUNet
+        from monai.networks.nets import diffusion_model_unet as _dmu
+
+        hidden_channels = list(hidden_channels or [32, 64, 128, 128])
+        self.ny, self.nx, self.T, self.nlayers = ny, nx, T, nlayers
+        self.state_dim = nlayers * ny * nx
+        self.param_dim = 0
+        self.cond_extra_dim = 0
+        self.time_multiple = 2 ** (len(hidden_channels) - 1)
+        self.backbone = DiffusionModelUNet(
+            spatial_dims=3, in_channels=3 * nlayers, out_channels=nlayers,
+            channels=tuple(hidden_channels),
+            attention_levels=tuple(False for _ in hidden_channels),
+            num_res_blocks=num_res_blocks, norm_num_groups=norm_num_groups)
+        if dropout > 0:
+            for module in self.backbone.modules():
+                if isinstance(module, _dmu.DiffusionUNetResnetBlock):
+                    module.dropout = nn.Dropout(dropout)
+        self.interpolant = LinearInterpolant(nu=1.0)
+        self.N_outer = N_outer
+        self.sigma_prior = sigma_prior
+        self.train_tau_0_only = False
+
+    def forward(self, x_t: torch.Tensor, batch, tau: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x_t.shape
+        grid = (b, t, self.nlayers, self.ny, self.nx)
+        x = torch.cat([x_t.reshape(grid),
+                       torch.nan_to_num(batch.obs, nan=0.0).reshape(grid),
+                       batch.obs_mask.to(x_t.dtype).reshape(grid)], dim=2)
+        x = x.permute(0, 2, 1, 3, 4)
+        pad = -t % self.time_multiple
+        if pad:
+            x = F.pad(x, (0, 0, 0, 0, 0, pad))
+        v = self.backbone(x, tau)[:, :, :t]
+        return v.permute(0, 2, 1, 3, 4).reshape(b, t, self.state_dim)
+
+
+class MonaiDirectUNet3DQG(nn.Module):
+    """DirectUNet (single-pass regression, the G1 role) on a 3D backbone: MONAI's
+    `DiffusionModelUNet` with `spatial_dims=3` over (time, ny, nx), the per-cell obs and obs
+    mask of both layers as the 4 input channels and the 2-layer psi as the output; the
+    flow-time input is held at 0. Convolutions are periodic in space and zero-padded in
+    time (`SpaceCircularConv3d`) and share their weights across days, so one network runs on
+    any window length (`any_length`); `T` is the training window. Time is zero-padded at
+    the end to a multiple of the backbone's downsampling factor, padded days dropped.
+    `forward(batch) -> (B, T, D)`, the contract of `MonaiDirectUNetQGChannelTime`.
+    """
+
+    any_length = True
+
+    def __init__(self, ny: int, nx: int, T: int, nlayers: int = 2,
+                 hidden_channels: list[int] | None = None, num_res_blocks: int = 2,
+                 norm_num_groups: int = 8, dropout: float = 0.1):
+        super().__init__()
+        _patch_conv2d_circular()
+        from monai.networks.nets import DiffusionModelUNet
+        from monai.networks.nets import diffusion_model_unet as _dmu
+
+        hidden_channels = list(hidden_channels or [32, 64, 128, 128])
+        self.ny, self.nx, self.T, self.nlayers = ny, nx, T, nlayers
+        self.state_dim = nlayers * ny * nx
+        self.time_multiple = 2 ** (len(hidden_channels) - 1)
+        self.backbone = DiffusionModelUNet(
+            spatial_dims=3, in_channels=2 * nlayers, out_channels=nlayers,
+            channels=tuple(hidden_channels),
+            attention_levels=tuple(False for _ in hidden_channels),
+            num_res_blocks=num_res_blocks, norm_num_groups=norm_num_groups)
+        if dropout > 0:
+            for module in self.backbone.modules():
+                if isinstance(module, _dmu.DiffusionUNetResnetBlock):
+                    module.dropout = nn.Dropout(dropout)
+
+    def forward(self, batch) -> torch.Tensor:
+        obs = batch.obs
+        b, t, _ = obs.shape
+        grid = (b, t, self.nlayers, self.ny, self.nx)
+        x = torch.cat([obs.reshape(grid), batch.obs_mask.to(obs.dtype).reshape(grid)], dim=2)
+        x = x.permute(0, 2, 1, 3, 4)
+        pad = -t % self.time_multiple
+        if pad:
+            x = F.pad(x, (0, 0, 0, 0, 0, pad))
+        out = self.backbone(x, torch.zeros(b, device=obs.device, dtype=obs.dtype))[:, :, :t]
+        return out.permute(0, 2, 1, 3, 4).reshape(b, t, self.state_dim)

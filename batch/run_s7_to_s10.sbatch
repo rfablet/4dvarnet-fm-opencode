@@ -1,0 +1,47 @@
+#!/bin/bash
+#SBATCH --account=odyssey
+#SBATCH --partition=Odyssey_GPU
+#SBATCH --gres=gpu:rtx8000:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=03:00:00
+#SBATCH --array=0-3
+#SBATCH --job-name=s7-s10-s0s1
+#SBATCH --output=sbatch_logs/s7_s10_%A_%a.out
+#SBATCH --error=sbatch_logs/s7_s10_%A_%a.err
+
+set -euo pipefail
+
+cd /Odyssey/private/rfablet/Python/4dvarnet-fm-opencode
+
+export PATH="/Odyssey/private/rfablet/miniforge3/envs/fdv-monai-proto/bin:$PATH"
+export CONDA_DEFAULT_ENV=fdv-monai-proto
+export PYTHONUNBUFFERED=1
+NODE_TMP="/SCRATCH/$USER/slurm_tmp/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"; mkdir -p "$NODE_TMP" 2>/dev/null || { NODE_TMP="/tmp/${USER}_slurm_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"; mkdir -p "$NODE_TMP"; }
+export TMPDIR="$NODE_TMP" MPLCONFIGDIR="$NODE_TMP/mplconfig"; trap 'rm -rf "$NODE_TMP"' EXIT
+mkdir -p "$MPLCONFIGDIR" sbatch_logs experiments
+
+EXPERIMENTS=(
+  S7_direct_unet_s0s1
+  S8_direct_unet_s0s1_small
+  S9_vanilla_cfm_s0s1_tau0
+  S10_vanilla_cfm_s0s1_small_tau0
+)
+EXP=${EXPERIMENTS[$SLURM_ARRAY_TASK_ID]}
+
+echo "============================================"
+echo " S7-S10 S0/S1 Benchmark | $(date)"
+echo "============================================"
+echo "  Task: ${SLURM_ARRAY_TASK_ID} / Experiment: ${EXP}"
+echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv -i 0 2>/dev/null | tail -1)"
+echo ""
+
+python train.py \
+  --config-name experiment/${EXP} \
+  hydra.run.dir=. \
+  hydra.output_subdir=null
+
+echo ""
+echo "============================================"
+echo " Done: ${EXP} at $(date)"
+echo "============================================"

@@ -2,12 +2,396 @@ import torch
 import torch.optim as optim
 import numpy as np
 from dataclasses import dataclass
+from models.dynamics import DynamicsBase
 
 
-def _apply_coupling(W: torch.Tensor, c1: float, coupling_type: str) -> torch.Tensor:
-    if coupling_type == "quartic":
-        return c1 * torch.sign(W) * W ** 2
-    return c1 * W
+def _gaspari_cohn(z):
+    z = float(z)
+    if z >= 2.0:
+        return 0.0
+    z2 = z * z
+    z3 = z2 * z
+    z4 = z3 * z
+    z5 = z4 * z
+    if z >= 1.0:
+        return (1.0/12.0)*z5 - 0.5*z4 + (5.0/8.0)*z3 + (5.0/3.0)*z2 - 5.0*z + 4.0 - 2.0/(3.0*z)
+    return -0.25*z5 + 0.5*z4 + (5.0/8.0)*z3 - (5.0/3.0)*z2 + 1.0
+
+
+def _build_loc_matrices(state_dim, obs_operator, NO, J, loc_radius, device):
+    if obs_operator.indices is not None:
+        obs_indices = obs_operator.indices.cpu().numpy()
+    else:
+        obs_indices = np.arange(state_dim)
+    obs_dim = len(obs_indices)
+
+    def pos(i):
+        return float(i) if i < NO else float((i - NO) // J)
+
+    state_pos = torch.tensor([pos(i) for i in range(state_dim)], device=device)
+    obs_pos = torch.tensor([pos(i) for i in obs_indices], device=device)
+
+    L_x = torch.zeros((state_dim, obs_dim), device=device)
+    L_y = torch.zeros((obs_dim, obs_dim), device=device)
+
+    for si in range(state_dim):
+        for oj in range(obs_dim):
+            d = abs(float(state_pos[si] - obs_pos[oj]))
+            d = min(d, NO - d)
+            L_x[si, oj] = _gaspari_cohn(d / loc_radius)
+
+    for oi in range(obs_dim):
+        for oj in range(obs_dim):
+            d = abs(float(obs_pos[oi] - obs_pos[oj]))
+            d = min(d, NO - d)
+            L_y[oi, oj] = _gaspari_cohn(d / loc_radius)
+
+    return L_x, L_y
+
+
+def _gc_matrix(z: torch.Tensor) -> torch.Tensor:
+    """Vectorized Gaspari-Cohn correlation function (z = distance/radius)."""
+    z2 = z * z
+    z3 = z2 * z
+    z4 = z3 * z
+    z5 = z4 * z
+    out = torch.zeros_like(z)
+    m_lt1 = z < 1.0
+    m_ge1 = (z >= 1.0) & (z < 2.0)
+    out[m_lt1] = (-0.25 * z5[m_lt1] + 0.5 * z4[m_lt1] + (5.0 / 8.0) * z3[m_lt1]
+                  - (5.0 / 3.0) * z2[m_lt1] + 1.0)
+    out[m_ge1] = ((1.0 / 12.0) * z5[m_ge1] - 0.5 * z4[m_ge1]
+                  + (5.0 / 8.0) * z3[m_ge1] + (5.0 / 3.0) * z2[m_ge1]
+                  - 5.0 * z[m_ge1] + 4.0 - 2.0 / (3.0 * z[m_ge1]))
+    return out
+
+
+def _build_qg_loc_matrices(state_dim: int, obs_indices_t: list, nlayers: int,
+                           ny: int, nx: int, loc_radius: float,
+                           device) -> tuple:
+    """Per-time Gaspari-Cohn localization for a layer-major flattened grid.
+
+    Returns (Lx_t, Ly_t): lists (one per obs time) of (state_dim, od) and
+    (od, od) correlation matrices built from grid distance. Cross-layer
+    separations are treated as very distant (weight -> 0).
+    """
+    gpl = ny * nx
+    ar = torch.arange(state_dim, device=device, dtype=torch.float64)
+    state_layer = ar // gpl
+    g = ar % gpl
+    state_y = g // nx
+    state_x = g % nx
+    layer_gap = 2.0 * max(ny, nx)
+    Lx_t: list[torch.Tensor | None] = []
+    Ly_t: list[torch.Tensor | None] = []
+    for idx_t in obs_indices_t:
+        if idx_t is None:
+            Lx_t.append(None)
+            Ly_t.append(None)
+            continue
+        idx = torch.tensor(idx_t, dtype=torch.long, device=device)
+        obs_layer = idx.to(device).to(torch.float64) // gpl
+        gg = (idx.to(device) % gpl).to(torch.float64)
+        obs_y = gg // nx
+        obs_x = gg % nx
+        dy = state_y.unsqueeze(1) - obs_y.unsqueeze(0)
+        dx = state_x.unsqueeze(1) - obs_x.unsqueeze(0)
+        dl = (state_layer.unsqueeze(1) - obs_layer.unsqueeze(0)).abs() * layer_gap
+        dist = torch.sqrt(dy ** 2 + dx ** 2 + dl ** 2)
+        Lx_t.append(_gc_matrix(dist / loc_radius).to(torch.float32))
+        doy = obs_y.unsqueeze(1) - obs_y.unsqueeze(0)
+        dox = obs_x.unsqueeze(1) - obs_x.unsqueeze(0)
+        dol = (obs_layer.unsqueeze(1) - obs_layer.unsqueeze(0)).abs() * layer_gap
+        dod = torch.sqrt(doy ** 2 + dox ** 2 + dol ** 2)
+        Ly_t.append(_gc_matrix(dod / loc_radius).to(torch.float32))
+    return Lx_t, Ly_t
+
+
+def _build_qg_col_loc_matrices(state_dim: int, obs_columns_t: list,
+                               nlayers: int, ny: int, nx: int,
+                               loc_radius: float, device,
+                               state_ny: int | None = None,
+                               state_nx: int | None = None,
+                               cross_layer: float = 0.0) -> tuple:
+    """Per-time Gaspari-Cohn localization for upper-layer column obs.
+
+    Each event observes `C` meridional columns of the upper layer (state dim
+    (nlayers, state_ny, state_nx), layer-major). Returns (Lx_t, Ly_t): lists
+    (one per obs time) of (state_dim, C*ny) and (C*ny, C*ny) correlation
+    matrices built from distance to the observed (layer=0) grid points.
+    Cross-layer separations -> weight 0.
+
+    `ny, nx` are the OBS grid dimensions. `state_ny/state_nx` (default = ny/nx)
+    give the DA-model grid; state positions are mapped onto the obs grid so the
+    Gaspari-Cohn distance is measured in obs-grid units (physical), which keeps
+    the same-resolution behaviour byte-identical and supports cross-resolution
+    DA models (S1: DA grid 16x16, obs grid 64x64).
+
+    `cross_layer` > 0 replaces the cross-layer weight 0 by `cross_layer` times
+    the horizontal Gaspari-Cohn weight (vertical localization); 0 keeps the
+    original matrices exactly.
+    """
+    s_ny = state_ny if state_ny is not None else ny
+    s_nx = state_nx if state_nx is not None else nx
+    gpl = s_ny * s_nx
+    ar = torch.arange(state_dim, device=device, dtype=torch.float64)
+    state_layer = ar // gpl
+    g = ar % gpl
+    state_y = (g // s_nx) * (ny / s_ny)
+    state_x = (g % s_nx) * (nx / s_nx)
+    layer_gap = 2.0 * max(ny, nx)
+    Lx_t: list[torch.Tensor | None] = []
+    Ly_t: list[torch.Tensor | None] = []
+    for cols in obs_columns_t:
+        if cols is None:
+            Lx_t.append(None)
+            Ly_t.append(None)
+            continue
+        cols_arr = torch.as_tensor(cols, dtype=torch.long, device=device)
+        C = cols_arr.numel()
+        od = C * ny
+        oy = torch.arange(ny, device=device, dtype=torch.float64).repeat(C)
+        ox = cols_arr.to(torch.float64).repeat_interleave(ny)
+        ol = torch.zeros(od, device=device, dtype=torch.float64)
+        dy = state_y.unsqueeze(1) - oy.unsqueeze(0)
+        dx = state_x.unsqueeze(1) - ox.unsqueeze(0)
+        dl = (state_layer.unsqueeze(1) - ol.unsqueeze(0)).abs() * layer_gap
+        if cross_layer > 0.0:
+            same = state_layer.unsqueeze(1) == ol.unsqueeze(0)
+            lx = _gc_matrix(torch.sqrt(dy ** 2 + dx ** 2) / loc_radius) * torch.where(
+                same, 1.0, float(cross_layer))
+        else:
+            lx = _gc_matrix(torch.sqrt(dy ** 2 + dx ** 2 + dl ** 2) / loc_radius)
+        Lx_t.append(lx.to(torch.float32))
+        doy = oy.unsqueeze(1) - oy.unsqueeze(0)
+        dox = ox.unsqueeze(1) - ox.unsqueeze(0)
+        dod = torch.sqrt(doy ** 2 + dox ** 2)
+        Ly_t.append(_gc_matrix(dod / loc_radius).to(torch.float32))
+    return Lx_t, Ly_t
+
+
+class ObsOperator:
+    def __init__(self, state_dim: int, obs_indices=None, obs_indices_t=None,
+                 h=None, h_index_at=None, n_obs=None):
+        """Observation operator.
+
+        Two mutually exclusive modes:
+          - index mode (default): `obs_indices` / `obs_indices_t` select state
+            coordinates (legacy, byte-for-byte unchanged).
+          - H-function mode: `h(state, index)` maps the full state to the obs
+            vector (e.g. spectral PV inversion for psi columns); `h_index_at`
+            maps a time to a per-time "mock" obs-index (for bookkeeping) and
+            `n_obs` fixes the (constant) observation dimension.
+        """
+        self._h = h
+        self._h_index_at = h_index_at
+        self._n_obs = n_obs if n_obs is not None else state_dim
+        self.indices: torch.Tensor | None = None
+        self.obs_indices_t: list[torch.Tensor | None] | None = None
+        if h is not None:
+            rep = h_index_at(None) if h_index_at is not None else None
+            if rep is not None:
+                self.indices = torch.as_tensor(rep, dtype=torch.long)
+            self._obs_dim = self._n_obs
+            return
+        if obs_indices_t is not None:
+            self.obs_indices_t = [
+                None if x is None else torch.as_tensor(x, dtype=torch.long)
+                for x in obs_indices_t]
+        if obs_indices is not None:
+            self.indices = torch.as_tensor(obs_indices, dtype=torch.long)
+            self._obs_dim = len(obs_indices)
+        elif self.obs_indices_t is not None:
+            first = next((x for x in self.obs_indices_t if x is not None), None)
+            if first is not None:
+                self.indices = torch.as_tensor(first, dtype=torch.long)
+            self._obs_dim = len(first) if first is not None else state_dim
+        else:
+            self._obs_dim = state_dim
+
+    @property
+    def h_mode(self) -> bool:
+        return self._h is not None
+
+    def index_at(self, index: int | None = None) -> torch.Tensor | None:
+        if self._h_index_at is not None:
+            return self._h_index_at(index)
+        if self.obs_indices_t is not None:
+            if index is None:
+                first = next((x for x in self.obs_indices_t if x is not None),
+                             None)
+                return first if first is not None else self.indices
+            return self.obs_indices_t[index]
+        return self.indices
+
+    def __call__(self, x: torch.Tensor, index: int | None = None,
+                 indices: torch.Tensor | None = None) -> torch.Tensor:
+        if self._h is not None:
+            return self._h(x, index)
+        idx = indices if indices is not None else self.index_at(index)
+        if idx is None:
+            return x
+        return x[..., idx]
+
+    @property
+    def obs_dim(self) -> int:
+        return self._obs_dim
+
+    def to(self, device):
+        if self.indices is not None:
+            self.indices = self.indices.to(device)
+        return self
+
+    def expand_to_state(self, obs_vec: torch.Tensor, state_dim: int) -> torch.Tensor:
+        if self.indices is None:
+            return obs_vec
+        full = torch.zeros(obs_vec.shape[:-1] + (state_dim,), device=obs_vec.device, dtype=obs_vec.dtype)
+        full[..., self.indices] = obs_vec
+        return full
+
+
+def _expand_obs_to_state(interp_obs, obs_operator, state_dim):
+    sd = state_dim
+    if obs_operator.indices is None:
+        return interp_obs
+    # Handle 1D input (single timestep) – previously crashed with
+    # ``*batch_dims, T = interp_obs.shape[:-1]`` when shape was ``(obs_dim,)``.
+    if interp_obs.dim() == 1:
+        full = torch.zeros(sd, device=interp_obs.device, dtype=interp_obs.dtype)
+        full[obs_operator.indices] = interp_obs
+        return full
+    *batch_dims, _unused = interp_obs.shape[:-1]
+    full = torch.zeros(interp_obs.shape[:-1] + (sd,), device=interp_obs.device, dtype=interp_obs.dtype)
+    full[..., obs_operator.indices] = interp_obs
+    return full
+
+
+def _init_bg_from_obs(interp_obs, obs_operator, state_dim, noise_std, device):
+    state = _expand_obs_to_state(interp_obs, obs_operator, state_dim)
+    if obs_operator.indices is not None:
+        noise = torch.randn_like(state) * noise_std
+        noise[..., obs_operator.indices] = 0.0
+        state = state + noise
+    else:
+        state = state + torch.randn_like(state) * noise_std
+    return state
+
+
+def _obs0_for_init(interp_obs0: torch.Tensor, init_fill) -> torch.Tensor:
+    """Step-0 obs vector the background is built from; ``init_fill`` fills
+    the channels a per-channel random layout leaves unobserved at step 0."""
+    if init_fill is not None:
+        interp_obs0 = init_fill(interp_obs0)
+    if torch.isnan(interp_obs0).any():
+        raise ValueError("step-0 obs vector has missing channels; pass init_fill")
+    return interp_obs0
+
+
+def _channel_obs_mask(obs: torch.Tensor, time_mask: torch.Tensor) -> torch.Tensor:
+    """Per-channel obs mask: an observed time AND a finite value, so channels
+    left NaN inside an observed row drop out of the obs cost."""
+    m = time_mask.bool()
+    if m.dim() < obs.dim():
+        m = m.unsqueeze(-1)
+    return torch.isfinite(obs) & m
+
+
+def _safe_ref(ref, analysis, obs_operator):
+    if analysis.shape[-1] != ref.shape[-1]:
+        if obs_operator is not None and obs_operator.indices is not None:
+            n_obs = len(obs_operator.indices)
+            n_an = analysis.shape[-1]
+            if n_an <= n_obs:
+                ref = ref[..., obs_operator.indices[:n_an].cpu().numpy()]
+            else:
+                ref = ref[..., :n_an]
+        else:
+            ref = ref[..., :analysis.shape[-1]]
+    return ref
+
+
+def _analysis_crps_step(ensemble: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Ensemble CRPS of the ANALYSIS ensemble ``(B, N, D)`` against ``(B, D)``
+    truth -- the same sorted-member formula as the flows' CRPS
+    (``evaluation.estimate_metrics.ensemble_window_scores``), unlike
+    ``_ESAccumulator`` which scores the forecast ensemble."""
+    N = ensemble.shape[1]
+    mae = (ensemble - ref.unsqueeze(1)).abs().mean(dim=1)
+    coeff = (2 * torch.arange(N, device=ensemble.device, dtype=ensemble.dtype) - N + 1).view(1, N, 1)
+    pairwise = 2 * (coeff * torch.sort(ensemble, dim=1).values).sum(dim=1) / (N * N)
+    return mae - 0.5 * pairwise
+
+
+class _ESAccumulator:
+    """Accumulates per-step Energy Score contributions without storing the ensemble.
+
+    ES_d = mean_t[ (1/N) sum_i |x_i,d(t) - y_d(t)|
+                    - (1/(2 N^2)) sum_i sum_j |x_i,d(t) - x_j,d(t)| ]
+    """
+
+    def __init__(self, num_steps: int, sd: int, N: int):
+        self.num_steps = num_steps
+        self.N = N
+        self.abs_err = np.zeros(sd)
+        self.pairwise = np.zeros(sd)
+        self.t = 0
+
+    def step(self, ensemble_t, ref_t) -> None:
+        # Both arguments may arrive as a tensor or as a numpy array: the
+        # ensemble filters pass tensors, while Strong4DVar/Weak4DVar pass a
+        # slice of an already-converted numpy analysis. The guard used to cover
+        # ref_t only, so the deterministic methods raised
+        # "'numpy.ndarray' object has no attribute 'detach'" whenever ES
+        # accumulation was enabled.
+        if isinstance(ensemble_t, torch.Tensor):
+            ens = ensemble_t.detach().cpu().numpy()  # (N, sd)
+        else:
+            ens = np.asarray(ensemble_t)
+        if isinstance(ref_t, torch.Tensor):
+            ref = ref_t.detach().cpu().numpy()
+        else:
+            ref = np.asarray(ref_t)
+        ref = ref.astype(ens.dtype, copy=False)
+        self.abs_err += np.mean(np.abs(ens - ref[np.newaxis, :]), axis=0)
+        N = self.N
+        for i in range(N):
+            for j in range(N):
+                self.pairwise += np.abs(ens[i] - ens[j])
+        self.t += 1
+
+    def es(self) -> np.ndarray:
+        """Pooled per-dimension Energy Score (matches ``metrics.energy_score``).
+
+        ES_d = mean_t[ (1/N) sum_i |x_i,d(t) - y_d(t)|
+                       - (1/(2 N^2)) sum_i sum_j |x_i,d(t) - x_j,d(t)| ]
+        """
+        t = max(self.t, 1)
+        return (
+            self.abs_err / t
+            - 0.5 * self.pairwise / (t * self.N * self.N)
+        )
+
+
+def _interp_observations(observations, obs_mask):
+    B, T, D = observations.shape
+    obs_np = observations.cpu().numpy()
+    mask_np = obs_mask.cpu().numpy()
+    if mask_np.ndim == 3:
+        mask_np = mask_np[..., 0]
+    interp = np.zeros_like(obs_np)
+    t = np.arange(T)
+    for b in range(B):
+        for d in range(D):
+            idx = np.where(mask_np[b])[0]
+            if len(idx) == 0:
+                interp[b, :, d] = 0.0
+            elif len(idx) == 1:
+                interp[b, :, d] = obs_np[b, idx[0], d]
+            else:
+                interp[b, :, d] = np.interp(t, idx, obs_np[b, idx, d],
+                                            left=obs_np[b, idx[0], d],
+                                            right=obs_np[b, idx[-1], d])
+    return torch.from_numpy(interp).to(device=observations.device, dtype=observations.dtype)
 
 
 @dataclass
@@ -16,6 +400,9 @@ class BaselineResult:
     rmse: np.ndarray
     ensemble: np.ndarray = None
     ensemble_variance: np.ndarray = None
+    params: np.ndarray = None
+    es: np.ndarray = None
+    crps: np.ndarray = None
 
 
 class Weak4DVar:
@@ -29,7 +416,10 @@ class Weak4DVar:
         opt_steps: int = 150,
         dt: float = 0.01,
         device: torch.device = torch.device("cpu"),
-        coupling_type: str = "linear",
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+        obs_operator: ObsOperator = None,
+        init_fill=None,
     ):
         self.da_window_steps = da_window_steps
         self.B_var = B_var
@@ -39,7 +429,11 @@ class Weak4DVar:
         self.opt_steps = opt_steps
         self.dt = dt
         self.device = device
-        self.coupling_type = coupling_type
+        self.coupling_exponent = coupling_exponent
+        self.dynamics = dynamics
+        self.state_dim = dynamics.state_dim if dynamics else 3
+        self.obs_operator = obs_operator or ObsOperator(self.state_dim)
+        self.init_fill = init_fill
 
     def assimilate(
         self,
@@ -51,12 +445,17 @@ class Weak4DVar:
         rho: float = 28.0,
         beta: float = 8 / 3,
         c1: float = 1.0,
+            **kwargs,
     ) -> BaselineResult:
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
+
+        sd = self.state_dim
         num_steps = observations.shape[0]
         num_windows = num_steps // self.da_window_steps
-        analysis = np.zeros((num_steps, 3))
+        analysis = np.zeros((num_steps, sd))
 
-        current_bg = observations[0].clone() + torch.randn(3, device=self.device) * 1.5
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        current_bg = _init_bg_from_obs(interp_obs[0], self.obs_operator, sd, 1.5, self.device)
 
         for w in range(num_windows):
             start = w * self.da_window_steps
@@ -66,69 +465,57 @@ class Weak4DVar:
             win_force = forcing[start:end]
 
             x0_ctrl = current_bg.clone().detach().requires_grad_(True)
-            q_ctrl = torch.zeros((self.da_window_steps, 3), device=self.device, requires_grad=True)
+            q_ctrl = torch.zeros(self.da_window_steps, sd, device=self.device, requires_grad=True)
             x_bg_ref = current_bg.clone().detach()
 
             opt = optim.Adam([x0_ctrl, q_ctrl], lr=self.lr)
 
+            H = self.obs_operator
             for _ in range(self.opt_steps):
                 opt.zero_grad()
-                traj = self._forward_weak(x0_ctrl, q_ctrl, self.da_window_steps, start, win_force, sigma, rho, beta, c1)
+                traj = self._forward_weak(x0_ctrl, q_ctrl, self.da_window_steps, start, win_force, **params)
                 J_b = torch.sum((x0_ctrl - x_bg_ref) ** 2) / self.B_var
                 J_q = torch.sum(q_ctrl ** 2) / self.Q_var
                 J_o = torch.tensor(0.0, device=self.device)
                 for t in range(self.da_window_steps):
                     if win_mask[t]:
-                        J_o += torch.sum((traj[t] - win_obs[t]) ** 2) / self.R_var
+                        diff = H(traj[t]) - win_obs[t]
+                        J_o += torch.sum(diff ** 2) / self.R_var
                 J_total = 0.5 * J_b + 0.5 * J_o + 0.5 * J_q
                 J_total.backward()
                 opt.step()
 
             final_traj = self._forward_weak(
-                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, sigma, rho, beta, c1
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, **params
             )
             analysis[start:end] = final_traj.detach().cpu().numpy()
             next_forecast = self._forward_weak(
-                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, sigma, rho, beta, c1
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, **params
             )
             current_bg = next_forecast[-1].detach()
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
         rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
         return BaselineResult(trajectory=analysis, rmse=rmse)
 
-    def _forward_weak(self, x0, q, steps, start_idx, forcing, sigma, rho, beta, c1, clip_range=50.0):
+    def _forward_weak(self, x0, q, steps, start_idx, forcing, clip_range=50.0, **kwargs):
         traj = [x0]
         for t in range(1, steps):
             s = traj[-1]
-            X, Y, Z = s[0], s[1], s[2]
             W = forcing[t - 1]
-            dX = sigma * (Y - X) + _apply_coupling(W, c1, self.coupling_type)
-            dY = X * (rho - Z) - Y
-            dZ = X * Y - beta * Z
-            Xn = X + dX * self.dt + q[t, 0]
-            Yn = Y + dY * self.dt + q[t, 1]
-            Zn = Z + dZ * self.dt + q[t, 2]
-            next_s = torch.stack([Xn, Yn, Zn])
+            next_s = self.dynamics.step(s, W, **kwargs) + q[t]
             if clip_range is not None:
                 next_s = torch.clamp(next_s, -clip_range, clip_range)
             traj.append(next_s)
         return torch.stack(traj)
 
-    def _forward_weak_batch(self, x0, q, steps, start_idx, forcing, sigma, rho, beta, c1, clip_range=50.0):
-        B = x0.shape[0]
+    def _forward_weak_batch(self, x0, q, steps, start_idx, forcing, clip_range=50.0, **kwargs):
         traj = [x0]
         for t in range(1, steps):
             s = traj[-1]
-            X, Y, Z = s[:, 0], s[:, 1], s[:, 2]
             W = forcing[:, t - 1]
-            dX = sigma * (Y - X) + _apply_coupling(W, c1, self.coupling_type)
-            dY = X * (rho - Z) - Y
-            dZ = X * Y - beta * Z
-            Xn = X + dX * self.dt + q[:, t, 0]
-            Yn = Y + dY * self.dt + q[:, t, 1]
-            Zn = Z + dZ * self.dt + q[:, t, 2]
-            next_s = torch.stack([Xn, Yn, Zn], dim=1)
+            next_s = self.dynamics.step(s, W, **kwargs) + q[:, t]
             if clip_range is not None:
                 next_s = torch.clamp(next_s, -clip_range, clip_range)
             traj.append(next_s)
@@ -144,12 +531,17 @@ class Weak4DVar:
         rho: float = 28.0,
         beta: float = 8 / 3,
         c1: float = 1.0,
+            **kwargs,
     ) -> list:
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
+
+        sd = self.state_dim
         B, num_steps, _ = observations.shape
         num_windows = num_steps // self.da_window_steps
-        analysis = np.zeros((B, num_steps, 3))
+        analysis = np.zeros((B, num_steps, sd))
 
-        current_bg = observations[:, 0].clone() + torch.randn(B, 3, device=self.device) * 1.5
+        interp_obs = _interp_observations(observations, obs_mask)
+        current_bg = _init_bg_from_obs(_obs0_for_init(interp_obs[:, 0], self.init_fill), self.obs_operator, sd, 1.5, self.device)
 
         for w in range(num_windows):
             start = w * self.da_window_steps
@@ -159,33 +551,36 @@ class Weak4DVar:
             win_force = forcing[:, start:end]
 
             x0_ctrl = current_bg.clone().detach().requires_grad_(True)
-            q_ctrl = torch.zeros((B, self.da_window_steps, 3), device=self.device, requires_grad=True)
+            q_ctrl = torch.zeros(B, self.da_window_steps, sd, device=self.device, requires_grad=True)
             x_bg_ref = current_bg.clone().detach()
 
             opt = optim.Adam([x0_ctrl, q_ctrl], lr=self.lr)
 
+            H = self.obs_operator
             for _ in range(self.opt_steps):
                 opt.zero_grad()
-                traj = self._forward_weak_batch(x0_ctrl, q_ctrl, self.da_window_steps, start, win_force, sigma, rho, beta, c1)
+                traj = self._forward_weak_batch(x0_ctrl, q_ctrl, self.da_window_steps, start, win_force, **params)
                 J_b = torch.sum((x0_ctrl - x_bg_ref) ** 2) / self.B_var
                 J_q = torch.sum(q_ctrl ** 2) / self.Q_var
-                diff = traj - win_obs
-                masked_diff = diff * win_mask.unsqueeze(-1)
+                win_obs_clean = torch.nan_to_num(win_obs, nan=0.0)
+                diff = H(traj) - win_obs_clean
+                masked_diff = diff * _channel_obs_mask(win_obs, win_mask).to(diff.dtype)
                 J_o = torch.sum(masked_diff ** 2) / self.R_var
                 J_total = 0.5 * J_b + 0.5 * J_o + 0.5 * J_q
                 J_total.backward()
                 opt.step()
 
             final_traj = self._forward_weak_batch(
-                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, sigma, rho, beta, c1
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, **params
             )
             analysis[:, start:end] = final_traj.detach().cpu().numpy()
             next_forecast = self._forward_weak_batch(
-                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, sigma, rho, beta, c1
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps, start, win_force, **params
             )
             current_bg = next_forecast[:, -1].detach()
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
         results = []
         for b in range(B):
             rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
@@ -203,7 +598,10 @@ class Strong4DVar:
         lr: float = 0.1,
         dt: float = 0.01,
         device: torch.device = torch.device("cpu"),
-        coupling_type: str = "linear",
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+        obs_operator: ObsOperator = None,
+        init_fill=None,
     ):
         self.da_window_steps = da_window_steps
         self.B_var = B_var
@@ -212,7 +610,11 @@ class Strong4DVar:
         self.lr = lr
         self.dt = dt
         self.device = device
-        self.coupling_type = coupling_type
+        self.coupling_exponent = coupling_exponent
+        self.dynamics = dynamics
+        self.state_dim = dynamics.state_dim if dynamics else 3
+        self.obs_operator = obs_operator or ObsOperator(self.state_dim)
+        self.init_fill = init_fill
 
     def assimilate(
         self,
@@ -224,12 +626,24 @@ class Strong4DVar:
         rho: float = 28.0,
         beta: float = 8 / 3,
         c1: float = 1.0,
+            **kwargs,
     ) -> BaselineResult:
-        num_steps = observations.shape[0]
-        num_windows = num_steps // self.da_window_steps
-        analysis = np.zeros((num_steps, 3))
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
 
-        current_bg = observations[0].clone() + torch.randn(3, device=self.device) * 1.5
+        num_steps = observations.shape[0]
+        sd = self.state_dim
+        num_windows = num_steps // self.da_window_steps
+        analysis = np.zeros((num_steps, sd))
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        current_bg = _init_bg_from_obs(interp_obs[0], self.obs_operator, sd, 1.5, self.device)
+        H = self.obs_operator
+
+        # ES accumulator for deterministic methods (N=1 -> ES = MAE)
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == self.state_dim
+        ) else None
+        es_acc = _ESAccumulator(num_steps, self.state_dim, 1) if ref_full is not None else None
 
         for w in range(num_windows):
             start = w * self.da_window_steps
@@ -245,12 +659,13 @@ class Strong4DVar:
 
             def closure():
                 opt.zero_grad()
-                traj = self._forward_strong(x_ctrl, self.da_window_steps, start, win_force, sigma, rho, beta, c1)
+                traj = self._forward_strong(x_ctrl, self.da_window_steps, start, win_force, **params)
                 J_b = torch.sum((x_ctrl - x_bg_ref) ** 2) / self.B_var
                 J_o = torch.tensor(0.0, device=self.device)
                 for t in range(self.da_window_steps):
                     if win_mask[t]:
-                        J_o += torch.sum((traj[t] - win_obs[t]) ** 2) / self.R_var
+                        diff = H(traj[t]) - win_obs[t]
+                        J_o += torch.sum(diff ** 2) / self.R_var
                 J_total = 0.5 * J_b + 0.5 * J_o
                 J_total.backward()
                 return J_total
@@ -259,41 +674,40 @@ class Strong4DVar:
                 opt.step(closure)
 
             final_traj = self._forward_strong(
-                x_ctrl.detach(), self.da_window_steps, start, win_force, sigma, rho, beta, c1
+                x_ctrl.detach(), self.da_window_steps, start, win_force, **params
             )
             analysis[start:end] = final_traj.detach().cpu().numpy()
             current_bg = final_traj[-1].detach()
+            
+            # ES step for deterministic method
+            if es_acc is not None:
+                for t in range(self.da_window_steps):
+                    analysis_t = analysis[start + t, :].reshape(1, -1)
+                    es_acc.step(analysis_t, ref_full[start + t])
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
         rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
-        return BaselineResult(trajectory=analysis, rmse=rmse)
+        es = es_acc.es() if es_acc is not None else None
+        return BaselineResult(trajectory=analysis, rmse=rmse, es=es)
 
-    def _forward_strong(self, x0, steps, start_idx, forcing, sigma, rho, beta, c1, clip_range=50.0):
+    def _forward_strong(self, x0, steps, start_idx, forcing, clip_range=50.0, **kwargs):
         traj = [x0]
         for t in range(1, steps):
             s = traj[-1]
-            X, Y, Z = s[0], s[1], s[2]
             W = forcing[t - 1]
-            dX = sigma * (Y - X) + _apply_coupling(W, c1, self.coupling_type)
-            dY = X * (rho - Z) - Y
-            dZ = X * Y - beta * Z
-            next_s = torch.stack([X + dX * self.dt, Y + dY * self.dt, Z + dZ * self.dt])
+            next_s = self.dynamics.step(s, W, **kwargs)
             if clip_range is not None:
                 next_s = torch.clamp(next_s, -clip_range, clip_range)
             traj.append(next_s)
         return torch.stack(traj)
 
-    def _forward_strong_batch(self, x0, steps, start_idx, forcing, sigma, rho, beta, c1, clip_range=50.0):
-        B = x0.shape[0]
+    def _forward_strong_batch(self, x0, steps, start_idx, forcing, clip_range=50.0, **kwargs):
         traj = [x0]
         for t in range(1, steps):
             s = traj[-1]
-            X, Y, Z = s[:, 0], s[:, 1], s[:, 2]
             W = forcing[:, t - 1]
-            dX = sigma * (Y - X) + _apply_coupling(W, c1, self.coupling_type)
-            dY = X * (rho - Z) - Y
-            dZ = X * Y - beta * Z
-            next_s = torch.stack([X + dX * self.dt, Y + dY * self.dt, Z + dZ * self.dt], dim=1)
+            next_s = self.dynamics.step(s, W, **kwargs)
             if clip_range is not None:
                 next_s = torch.clamp(next_s, -clip_range, clip_range)
             traj.append(next_s)
@@ -309,12 +723,18 @@ class Strong4DVar:
         rho: float = 28.0,
         beta: float = 8 / 3,
         c1: float = 1.0,
+            **kwargs,
     ) -> list:
-        B, num_steps, _ = observations.shape
-        num_windows = num_steps // self.da_window_steps
-        analysis = np.zeros((B, num_steps, 3))
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
 
-        current_bg = observations[:, 0].clone() + torch.randn(B, 3, device=self.device) * 1.5
+        B, num_steps, _ = observations.shape
+        sd = self.state_dim
+        num_windows = num_steps // self.da_window_steps
+        analysis = np.zeros((B, num_steps, sd))
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        current_bg = _init_bg_from_obs(_obs0_for_init(interp_obs[:, 0], self.init_fill), self.obs_operator, sd, 1.5, self.device)
+        H = self.obs_operator
 
         for w in range(num_windows):
             start = w * self.da_window_steps
@@ -330,27 +750,367 @@ class Strong4DVar:
 
             for _ in range(self.max_iter * 4 if hasattr(self, 'max_iter') else 160):
                 opt.zero_grad()
-                traj = self._forward_strong_batch(x_ctrl, self.da_window_steps, start, win_force, sigma, rho, beta, c1)
+                traj = self._forward_strong_batch(x_ctrl, self.da_window_steps, start, win_force, **params)
                 J_b = torch.sum((x_ctrl - x_bg_ref) ** 2) / self.B_var
-                diff = traj - win_obs
-                masked_diff = diff * win_mask.unsqueeze(-1)
+                win_obs_clean = torch.nan_to_num(win_obs, nan=0.0)
+                diff = H(traj) - win_obs_clean
+                masked_diff = diff * _channel_obs_mask(win_obs, win_mask).to(diff.dtype)
                 J_o = torch.sum(masked_diff ** 2) / self.R_var
                 J_total = 0.5 * J_b + 0.5 * J_o
                 J_total.backward()
                 opt.step()
 
             final_traj = self._forward_strong_batch(
-                x_ctrl.detach(), self.da_window_steps, start, win_force, sigma, rho, beta, c1
+                x_ctrl.detach(), self.da_window_steps, start, win_force, **params
             )
             analysis[:, start:end] = final_traj.detach().cpu().numpy()
             current_bg = final_traj[:, -1].detach()
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == self.state_dim
+        ) else None
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
         results = []
         for b in range(B):
             rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
-            results.append(BaselineResult(trajectory=analysis[b], rmse=rmse_b))
+            es_b = (
+                np.mean(np.abs(analysis[b] - ref_full[b]), axis=0)
+                if ref_full is not None else None
+            )
+            results.append(BaselineResult(trajectory=analysis[b], rmse=rmse_b, es=es_b))
         return results
+
+
+class L96Weak4DVar:
+    """Strong/Weak-constraint 4D-Var for the L96 two-scale case study,
+    mirroring ``evaluation/run_qg_baselines.py::QG4DVar``'s whitened-control
+    + gradient-safety design -- deliberately NOT this module's own
+    ``Weak4DVar``/``Strong4DVar``.
+
+    Investigation (2026-09-16/17): this module's plain ``Weak4DVar`` --
+    raw-physical-unit ``q`` divided by a fixed ``Q_var`` in the loss, zero
+    gradient clipping, no NaN recovery -- diverges catastrophically on L96's
+    two-scale chaotic dynamics as soon as a free per-step model-error
+    control ``q`` is introduced over a real (``da_window_steps=500``)
+    window: plain Adam (``opt_steps=150, lr=0.02``, this project's own
+    established default) gives RMSE~12-26 (values far outside L96's normal
+    range, consistent with repeatedly hitting the ``clip_range`` clamp);
+    LBFGS with ``Strong4DVar``'s own *validated* settings
+    (``max_iter=10, lr=0.2`` -- confirmed by reproducing that class's own
+    ~0.81-1.0 RMSE with a from-scratch reimplementation) diverges to
+    outright NaN on the very first outer step. The SAME settings applied to
+    the strong-constraint (``x0``-only, no free ``q``) case work fine in
+    both classes. So the failure is isolated specifically to the raw-unit,
+    unclipped, unrecoverable weak-constraint optimization -- not the L96
+    dynamics, not the observation setup, not "weak-constraint DA is
+    impossible on chaotic systems" in general.
+
+    ``QG4DVar`` (used in production for the QG case study) never hits this:
+    it whitens both controls (``x0 = xb + L*w`` with ``L =
+    b_var_scale*sigma``; weak-mode ``q_t = dynamics.step(q_{t-1}) +
+    Lq*u_t`` with ``Lq = q_var_scale*sigma``, ``sigma = xb.std()``) so
+    gradients act on unit-scale variables instead of raw physical units
+    with unrelated column-to-column scales; it sanitizes Adam gradients
+    every step (``nan_to_num`` then ``clamp(-grad_clip, grad_clip)``); and
+    it resets the controls to zero (falling back to the pure
+    background/dynamics forecast for that window) the moment the loss or
+    any parameter goes non-finite, instead of letting a single NaN cascade
+    through every later window via ``current_bg``. This class ports all
+    three mechanisms to L96, keeping ``dynamics``/``obs_operator`` as
+    ``Lorenz96Dynamics``/``ObsOperator`` instances (this module's own,
+    unchanged) rather than QG's spectral-inversion machinery.
+    """
+
+    def __init__(self, dt, dynamics, obs_operator, da_window_steps=500,
+                 b_var_scale=1.0, q_var_scale=1.0, optimizer="adam",
+                 opt_steps=150, max_iter=10, lr=0.2, mode="weak",
+                 grad_clip=100.0, r_var=0.5, device=None):
+        self.dt = dt
+        self.dynamics = dynamics
+        self.obs_operator = obs_operator
+        self.da_window_steps = int(da_window_steps)
+        self.b_var_scale = float(b_var_scale)
+        self.q_var_scale = float(q_var_scale)
+        self.optimizer = optimizer
+        self.opt_steps = int(opt_steps)
+        self.max_iter = int(max_iter)
+        self.lr = float(lr)
+        self.mode = mode
+        self.grad_clip = float(grad_clip)
+        self.r_var = float(r_var)
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.state_dim = dynamics.state_dim
+        # Diagnostics (2026-09-17): how often/when the NaN-reset safety net
+        # actually fires, to distinguish "stable AND learning a real
+        # correction" from "stable only because it keeps resetting to the
+        # pure background/dynamics forecast" -- reset_step_indices[i] is
+        # the Adam step index (0-based; None for an LBFGS reset, which has
+        # no single triggering step) at which sub-window i's reset fired,
+        # or absent (no entry) if that sub-window never reset.
+        self.n_subwindows = 0
+        self.n_resets = 0
+        self.reset_step_indices = []
+
+    def _forward_strong(self, x0, win, force, params):
+        traj = [x0]
+        for t in range(1, win):
+            traj.append(self.dynamics.step(traj[-1], force[t - 1], **params))
+        return torch.stack(traj)
+
+    def _forward_weak(self, x0, u, win, force, Lq, params):
+        traj = [x0]
+        for t in range(1, win):
+            s = self.dynamics.step(traj[-1], force[t - 1], **params) + Lq * u[t]
+            s = torch.clamp(s, -self.dynamics.clip_range, self.dynamics.clip_range)
+            traj.append(s)
+        return torch.stack(traj)
+
+    def _obs_cost(self, traj, win_obs, win_mask, start):
+        H = self.obs_operator
+        Jo = torch.zeros((), device=self.device, dtype=torch.float32)
+        for t in range(traj.shape[0]):
+            if win_mask[t]:
+                diff = H(traj[t], index=start + t) - win_obs[t]
+                Jo = Jo + torch.sum(diff ** 2)
+        return Jo
+
+    def _reset_nan(self, params, step_index=None):
+        self.n_resets += 1
+        self.reset_step_indices.append(step_index)
+        with torch.no_grad():
+            for p in params:
+                p.fill_(0.0)
+
+    def _optimize(self, loss_fn, params):
+        """Mirrors QG4DVar._optimize exactly: Adam sanitizes/clips every
+        gradient and resets controls to zero on a non-finite loss; LBFGS's
+        closure skips backward() on a non-finite loss (returning it as-is
+        so LBFGS's own line search rejects the step) and resets afterward
+        if any control ended up non-finite regardless."""
+        self.n_subwindows += 1
+        if self.optimizer == "lbfgs":
+            opt = torch.optim.LBFGS(params, lr=self.lr, max_iter=self.max_iter,
+                                    line_search_fn="strong_wolfe")
+
+            def closure():
+                opt.zero_grad()
+                J = loss_fn()
+                if not torch.isfinite(J).all():
+                    return J
+                J.backward()
+                return J
+
+            opt.step(closure)
+            if any(not torch.isfinite(p).all() for p in params):
+                self._reset_nan(params, step_index=None)
+            return
+        opt = torch.optim.Adam(params, lr=self.lr)
+        for step_i in range(self.opt_steps):
+            opt.zero_grad()
+            J = loss_fn()
+            if not torch.isfinite(J).all():
+                self._reset_nan(params, step_index=step_i)
+                break
+            J.backward()
+            for p in params:
+                if p.grad is not None:
+                    p.grad = torch.nan_to_num(p.grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                    p.grad = torch.clamp(p.grad, -self.grad_clip, self.grad_clip)
+            opt.step()
+
+    def _solve_window(self, xb, win_obs, win_mask, start, win_force, params):
+        sd = self.state_dim
+        win = win_obs.shape[0]
+        sigma = float(xb.std().clamp_min(1e-12))
+        L = self.b_var_scale * sigma
+
+        if self.mode == "strong":
+            w_ctrl = torch.zeros(sd, device=self.device, requires_grad=True)
+
+            def loss_fn():
+                x0 = xb + L * w_ctrl
+                traj = self._forward_strong(x0, win, win_force, params)
+                Jb = 0.5 * torch.sum(w_ctrl ** 2)
+                Jo = self._obs_cost(traj, win_obs, win_mask, start)
+                return 0.5 * Jo / self.r_var + Jb
+
+            self._optimize(loss_fn, [w_ctrl])
+            x0 = xb + L * w_ctrl.detach()
+            return self._forward_strong(x0, win, win_force, params).detach()
+
+        Lq = self.q_var_scale * sigma
+        w_ctrl = torch.zeros(sd, device=self.device, requires_grad=True)
+        u = torch.zeros((win, sd), device=self.device, requires_grad=True)
+
+        def loss_fn():
+            x0 = xb + L * w_ctrl
+            traj = self._forward_weak(x0, u, win, win_force, Lq, params)
+            Jb = 0.5 * torch.sum(w_ctrl ** 2)
+            Jq = 0.5 * torch.sum(u[1:] ** 2)
+            Jo = self._obs_cost(traj, win_obs, win_mask, start)
+            return 0.5 * Jo / self.r_var + Jb + Jq
+
+        self._optimize(loss_fn, [w_ctrl, u])
+        x0 = xb + L * w_ctrl.detach()
+        return self._forward_weak(x0, u.detach(), win, win_force, Lq, params).detach()
+
+    def assimilate(self, observations, obs_mask, forcing, true_state=None,
+                   F=8.0, c1=1.0, h=1.0, hx=1.0, eps=0.1, fast_weights=None, **kwargs):
+        obs = observations.to(self.device)
+        mask = obs_mask.to(self.device)
+        force = forcing.to(self.device)
+        params = dict(F=F, c1=c1, h=h, hx=hx, eps=eps)
+        if fast_weights is not None:
+            params["fast_weights"] = fast_weights
+        params.update(kwargs)
+
+        num_steps = obs.shape[0]
+        sd = self.state_dim
+        win = self.da_window_steps
+        num_windows = max(1, num_steps // win)
+        analysis = torch.zeros(num_steps, sd, device=self.device)
+
+        interp_obs = _interp_observations(obs.unsqueeze(0), mask.unsqueeze(0))[0]
+        current_bg = _init_bg_from_obs(interp_obs[0], self.obs_operator, sd, 1.5, self.device)
+
+        for wnd in range(num_windows):
+            start = wnd * win
+            end = min(start + win, num_steps)
+            if end - start < 2:
+                break
+            traj = self._solve_window(
+                current_bg, obs[start:end], mask[start:end], start, force[start:end], params)
+            analysis[start:end] = traj
+            current_bg = traj[-1].detach()
+
+        analysis_np = analysis.detach().cpu().numpy()
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis_np, self.obs_operator)
+        rmse = np.sqrt(np.mean((analysis_np - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis_np, rmse=rmse)
+
+
+def _expand_batch_params(params: dict, B: int, N: int) -> dict:
+    """Repeat per-window params over the N members of each window's ensemble:
+    1-D ``(B,)`` scalars -> ``(B*N,)`` and 2-D ``(B, k)`` vectors (per-window
+    ``fast_weights``) -> ``(B*N, k)``; anything else passes through."""
+    out = {}
+    for k, v in params.items():
+        if isinstance(v, torch.Tensor) and (v.dim() == 1 or (v.dim() == 2 and v.shape[0] == B)):
+            v = v.unsqueeze(1).expand(B, N, *v.shape[1:]).reshape(B * N, *v.shape[1:])
+        out[k] = v
+    return out
+
+
+def _etkf_sqrt_transform(U: torch.Tensor, d: torch.Tensor, N1: int, d_null) -> torch.Tensor:
+    """Symmetric square root sqrt(N1) (N1 I + Yᵀ Y)^(-1/2) in ensemble space.
+
+    ``U`` (N, r) and ``d`` (r,) come from a thin SVD of the (N, od) weighted
+    obs anomalies. When od < N the thin SVD has r < N columns, and the
+    directions orthogonal to them -- the ones the observations do not
+    constrain, eigenvalue ``d_null`` -- must be kept rather than zeroed:
+    dropping them collapses the analysis anomalies to rank r at every cycle.
+    """
+    Tmat = U @ torch.diag(torch.sqrt(N1 / d)) @ U.T
+    if U.shape[1] < U.shape[0]:
+        null_proj = torch.eye(U.shape[0], dtype=U.dtype, device=U.device) - U @ U.T
+        Tmat = Tmat + (N1 / d_null) ** 0.5 * null_proj
+    return Tmat
+
+
+RELAX_MODES = (None, "rtpp", "rtps")
+
+
+def _relax_anomalies(ensemble: torch.Tensor, A_f: torch.Tensor, mode: str | None, alpha: float) -> torch.Tensor:
+    """Relaxation inflation: RTPP blends analysis and forecast anomalies; RTPS rescales the
+    analysis spread of each variable toward the forecast spread (Whitaker & Hamill 2012)."""
+    if mode is None or alpha == 0.0:
+        return ensemble
+    mu = torch.mean(ensemble, dim=0)
+    A_a = ensemble - mu
+    if mode == "rtpp":
+        return mu + (1.0 - alpha) * A_a + alpha * A_f
+    s_a = A_a.std(dim=0)
+    s_f = A_f.std(dim=0)
+    factor = torch.where(s_a > 0, 1.0 + alpha * (s_f - s_a) / s_a.clamp_min(1e-30), torch.ones_like(s_a))
+    return mu + A_a * factor
+
+
+def _ensrf_localized_analysis(mu: torch.Tensor, A: torch.Tensor, HA: torch.Tensor, dy: torch.Tensor,
+                              loc_Lx: torch.Tensor, loc_Ly: torch.Tensor, R_obs: torch.Tensor,
+                              ridge_frac: float, N1: int, record: list | None = None,
+                              t: int | None = None) -> torch.Tensor:
+    """Localized deterministic (EnSRF) analysis ensemble.
+
+    Sample covariances normalized by N - 1 and localized (`loc_Lx` state-obs,
+    `loc_Ly` obs-obs); the mean gets the Kalman gain K = P Hᵀ S⁻¹ and the
+    anomalies the modified gain K̃ = P Hᵀ S^(-1/2) (S^(1/2) + R^(1/2))⁻¹
+    (Andrews 1968; Whitaker & Hamill 2002), so that without localization the
+    analysis anomaly covariance is exactly (I - K H) P. `ridge_frac` x the
+    largest background obs-space variance is added to R (both in S and in
+    R^(1/2)). R_obs must be diagonal.
+
+    With ``record`` a list, appends ``(t, HA, S⁻¹dy, M, loc_Lx)`` with
+    M = S^(-1/2) (S^(1/2) + R^(1/2))⁻¹, everything a localized EnKS needs to
+    apply this analysis retrospectively (``_enks_smooth_localized``).
+    """
+    dt = A.dtype
+    A64, HA64, dy64 = A.double(), HA.double(), dy.double()
+    Pf_Ht = loc_Lx.double() * (A64.T @ HA64) / N1
+    HPH = loc_Ly.double() * (HA64.T @ HA64) / N1
+    r_diag = torch.diagonal(R_obs).double() + ridge_frac * HPH.diagonal().max()
+    S = HPH + torch.diag(r_diag)
+    lam, V = torch.linalg.eigh(0.5 * (S + S.T))
+    lam = lam.clamp_min(1e-12 * lam.max())
+    s_half = (V * lam.sqrt()) @ V.T
+    s_ihalf = (V * lam.rsqrt()) @ V.T
+    v = ((V / lam) @ V.T) @ dy64
+    M = s_ihalf @ torch.linalg.inv(s_half + torch.diag(r_diag.sqrt()))
+    if record is not None:
+        record.append((t, HA.detach().float(), v.float(), M.float(), loc_Lx))
+    mu_a = mu.double() + Pf_Ht @ v
+    return (mu_a.unsqueeze(0) + A64 - HA64 @ (Pf_Ht @ M).T).to(dt)
+
+
+def _enks_smooth_localized(ensemble: torch.Tensor, records: list, lag: int | None, N1: int,
+                           chunk: int = 32, taper_steps: float | None = None) -> torch.Tensor:
+    """Localized EnKS: apply each recorded EnSRF analysis to the earlier states.
+
+    ``ensemble`` (N, T, D) is the stored filter trajectory (post-analysis at
+    analysis times). Analyses are applied in time order; analysis k updates
+    the states s in [t_{k-lag}, t_k) (all s < t_k if ``lag`` is None) with the
+    cross-covariance C = L ∘ (A_sᵀ HA_k) / (N − 1), using the localization of
+    that analysis between the state points and its observations:
+    mean += C S⁻¹dy, anomalies −= HA_k (C M)ᵀ. Without localization, with
+    N − 1 ≥ D and a linear model, this is the RTS smoother of the filter.
+
+    ``taper_steps`` (τ, in model steps) localizes in time as well: the
+    cross-covariance of a state s with analysis k is multiplied by the
+    Gaspari–Cohn weight GC((t_k − s) / τ), which is 1 at s = t_k and 0 from
+    t_k − s = 2τ on (states beyond are skipped). It can replace or complement
+    the hard ``lag`` cutoff.
+    """
+    X = ensemble.clone()
+    times = [r[0] for r in records]
+    for k, (tk, HA, v, M, Lx) in enumerate(records):
+        lo = 0 if lag is None or k - lag < 0 else times[k - lag]
+        if taper_steps is not None:
+            lo = max(lo, tk - int(np.ceil(2.0 * taper_steps)) + 1)
+        Z = HA @ M.T
+        for c0 in range(max(lo, 0), tk, chunk):
+            c1 = min(tk, c0 + chunk)
+            Xs = X[:, c0:c1]
+            mu = Xs.mean(0, keepdim=True)
+            As = Xs - mu
+            C = Lx.unsqueeze(0) * torch.einsum("ntd,no->tdo", As, HA) / N1
+            if taper_steps is not None:
+                gap = torch.arange(tk - c0, tk - c1, -1, dtype=torch.float64, device=X.device)
+                C = C * _gc_matrix(gap / taper_steps).to(C.dtype)[:, None, None]
+            mu = mu + torch.einsum("tdo,o->td", C, v).unsqueeze(0)
+            As = As - torch.einsum("no,tdo->ntd", Z, C)
+            X[:, c0:c1] = mu + As
+    return X
 
 
 class ETKF:
@@ -361,14 +1121,64 @@ class ETKF:
         inflation: float = 1.0,
         dt: float = 0.01,
         device: torch.device = torch.device("cpu"),
-        coupling_type: str = "linear",
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+        obs_operator: ObsOperator = None,
+        loc_radius: float = None,
+        NO: int = 8,
+        J: int = 4,
+        loc_mode: str = "square_root",
+        noise_init_std: float = 1.5,
+        etkf_ridge: float = 0.0,
+        etkf_additive: float = 0.0,
+        R_var_vec: np.ndarray = None,
+        loc_Lx_t: list | None = None,
+        loc_Ly_t: list | None = None,
+        init_ensemble: torch.Tensor | None = None,
+        init_fill=None,
+        relax: str | None = None,
+        relax_alpha: float = 0.0,
     ):
+        if relax not in RELAX_MODES:
+            raise ValueError(f"relax must be one of {RELAX_MODES}, got {relax!r}")
+        self.relax, self.relax_alpha = relax, relax_alpha
         self.N_ensemble = N_ensemble
         self.R_var = R_var
+        self.R_var_vec = R_var_vec
         self.inflation = inflation
         self.dt = dt
         self.device = device
-        self.coupling_type = coupling_type
+        self.coupling_exponent = coupling_exponent
+        self.dynamics = dynamics
+        self.state_dim = dynamics.state_dim if dynamics else 3
+        self.obs_operator = obs_operator or ObsOperator(self.state_dim)
+        self.init_fill = init_fill
+        self.loc_radius = loc_radius
+        self.loc_mode = loc_mode
+        self.noise_init_std = noise_init_std
+        self.etkf_ridge = etkf_ridge
+        self.etkf_additive = etkf_additive
+        self.loc_Lx_t = loc_Lx_t
+        self.loc_Ly_t = loc_Ly_t
+        self.init_ensemble = init_ensemble
+        if loc_radius is not None and loc_Lx_t is None:
+            self.loc_Lx, self.loc_Ly = _build_loc_matrices(
+                self.state_dim, self.obs_operator, NO, J, loc_radius, device)
+
+    def _per_time(self, t: int) -> tuple:
+        # `idx.numel()` (rather than the operator's precomputed constant
+        # `obs_dim`) also covers h-mode operators whose `h_index_at` returns
+        # a per-time-varying-length index (e.g. a combined multi-stream H-
+        # function where not every stream has an event at every time) --
+        # falls back to the constant when idx is None, identical to every
+        # existing (constant-width) h-mode/index-mode operator.
+        idx = self.obs_operator.index_at(t)
+        od_t = idx.numel() if idx is not None else self.obs_operator.obs_dim
+        loc_Lx = self.loc_Lx_t[t] if self.loc_Lx_t is not None else getattr(
+            self, "loc_Lx", None)
+        loc_Ly = self.loc_Ly_t[t] if self.loc_Ly_t is not None else getattr(
+            self, "loc_Ly", None)
+        return idx, od_t, loc_Lx, loc_Ly
 
     def assimilate(
         self,
@@ -380,39 +1190,1474 @@ class ETKF:
         rho: float = 28.0,
         beta: float = 8 / 3,
         c1: float = 1.0,
+            **kwargs,
     ) -> BaselineResult:
-        num_steps = observations.shape[0]
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
+
+        # obs_mask.shape[0] (not observations.shape[0]): `observations` may
+        # be a plain list of variable-length per-time tensors (a combined
+        # multi-stream observation, widths varying by time) rather than a
+        # dense (T, od) tensor -- obs_mask is always a proper (T,) tensor
+        # regardless, so this is a strictly safer source of T. Identical
+        # value in every existing (dense-tensor) call site.
+        num_steps = obs_mask.shape[0]
+        sd = self.state_dim
         N = self.N_ensemble
         N1 = N - 1
-        R_sym_sqrt_inv = 1.0 / np.sqrt(self.R_var)
+        H = self.obs_operator
+        od = H.obs_dim
 
-        ensemble = observations[0].clone().unsqueeze(0).repeat(N, 1)
-        ensemble += torch.randn((N, 3), device=self.device) * 1.5
+        if self.R_var_vec is not None:
+            r_sqrt = torch.tensor(np.sqrt(self.R_var_vec), dtype=torch.float32, device=self.device)
+            r_inv = 1.0 / torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device)
+        else:
+            r_sqrt = np.sqrt(self.R_var)
+            r_inv = 1.0 / self.R_var
 
-        analysis = np.zeros((num_steps, 3))
-        ens_var = np.zeros((num_steps, 3))
+        if self.init_ensemble is not None:
+            ensemble = self.init_ensemble.clone()
+        else:
+            interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+            ensemble = _init_bg_from_obs(interp_obs[0], self.obs_operator, sd, self.noise_init_std, self.device).unsqueeze(0).repeat(N, 1)
+            noise = torch.randn_like(ensemble) * self.noise_init_std
+            if self.obs_operator.indices is not None:
+                noise_obs = torch.randn((N, od), device=self.device) * r_sqrt
+                noise[..., self.obs_operator.indices] = noise_obs
+            ensemble += noise
+
+        analysis = np.zeros((num_steps, sd))
+        ens_var = np.zeros((num_steps, sd))
+        # Full per-member trajectory (not just the mean/variance reductions
+        # above), so callers can score ensemble-aware metrics like CRPS
+        # (evaluation/metrics.py::crps) -- previously BaselineResult.ensemble
+        # was a np.zeros(...) stub, never actually populated.
+        ens_traj = np.zeros((N, num_steps, sd), dtype=np.float32)
         analysis[0] = torch.mean(ensemble, dim=0).cpu().numpy()
         ens_var[0] = torch.var(ensemble, dim=0).cpu().numpy()
+        ens_traj[:, 0] = ensemble.detach().cpu().numpy()
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+        es_acc = _ESAccumulator(num_steps, sd, N) if ref_full is not None else None
+        transforms = [] if getattr(self, "_record_transforms", False) else None
+        nan_hit = False
 
         for t in range(1, num_steps):
             W = forcing[t - 1]
-            Xe, Ye, Ze = ensemble[:, 0], ensemble[:, 1], ensemble[:, 2]
-            dX = sigma * (Ye - Xe) + _apply_coupling(W, c1, self.coupling_type)
-            dY = Xe * (rho - Ze) - Ye
-            dZ = Xe * Ye - beta * Ze
-            ensemble[:, 0] += dX * self.dt
-            ensemble[:, 1] += dY * self.dt
-            ensemble[:, 2] += dZ * self.dt
+            ensemble = self.dynamics.step(ensemble, W, **params)
+            # NaN safety: replace blown-up members with the mean of valid members
+            nan_mask = torch.isnan(ensemble).any(dim=-1)
+            if nan_mask.any():
+                nan_hit = True
+                mu_nan = torch.nanmean(ensemble, dim=0)
+                ensemble[nan_mask] = mu_nan.masked_fill(mu_nan.isnan(), 0.0)
+            if es_acc is not None:
+                es_acc.step(ensemble, ref_full[t])
+
+
+            if obs_mask[t]:
+                idx, od_t, loc_Lx, loc_Ly = self._per_time(t)
+                y_t = observations[t]
+                mu = torch.mean(ensemble, dim=0)
+                A = ensemble - mu
+                mu_obs = H(mu, index=t)
+                HA = H(ensemble, index=t) - mu_obs.unsqueeze(0)
+                dy = y_t - mu_obs
+
+                if (self.loc_radius is not None or self.loc_Lx_t is not None) and self.loc_mode == "ensrf":
+                    R_obs = (torch.diag(torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device))
+                             if self.R_var_vec is not None
+                             else torch.eye(od_t, device=self.device) * self.R_var)
+                    ensemble = _ensrf_localized_analysis(mu, A, HA, dy, loc_Lx, loc_Ly, R_obs,
+                                                         max(self.etkf_ridge, 0.0), N1,
+                                                         record=getattr(self, "_enks_record", None), t=t)
+                    if self.etkf_additive > 0.0:
+                        ensemble = ensemble + torch.randn_like(ensemble) * self.etkf_additive
+                elif self.loc_radius is not None or self.loc_Lx_t is not None:
+                    Pf_Ht = A.T @ HA
+                    H_Pf_Ht = HA.T @ HA
+                    loc_Pf_Ht = loc_Lx * Pf_Ht
+                    loc_H_Pf_Ht = loc_Ly * H_Pf_Ht
+                    if self.R_var_vec is not None:
+                        R_obs = torch.diag(torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device))
+                    else:
+                        R_obs = torch.eye(od_t, device=self.device) * self.R_var
+                    ridge = (1e-4 if self.etkf_ridge <= 0.0 else self.etkf_ridge) * loc_H_Pf_Ht.max()
+                    Ph = loc_H_Pf_Ht + R_obs + ridge * torch.eye(od_t, device=self.device)
+                    K = torch.linalg.lstsq(Ph, loc_Pf_Ht.T).solution.T
+                    mu = mu + K @ dy
+                    if self.loc_mode == "square_root":
+                        ensemble = mu.unsqueeze(0) + A - HA @ K.T
+                    else:
+                        for n in range(N):
+                            perturbed = y_t + torch.randn(od_t, device=self.device) * r_sqrt
+                            ensemble[n] += K @ (perturbed - H(ensemble[n], index=t))
+                    if self.etkf_additive > 0.0:
+                        ensemble = ensemble + torch.randn_like(ensemble) * self.etkf_additive
+                else:
+                    HA_w = torch.nan_to_num(HA / r_sqrt)
+                    try:
+                        U, s, Vt = torch.linalg.svd(HA_w, full_matrices=False)
+                    except RuntimeError:
+                        U, s, Vt = torch.linalg.svd(HA_w.cpu(), full_matrices=False)
+                        U, s, Vt = U.to(HA_w.device), s.to(HA_w.device), Vt.to(HA_w.device)
+                    s2 = s ** 2
+                    d = s2 + N1 + self.etkf_ridge * s2.max()
+                    Pw = U @ torch.diag(1.0 / d) @ U.T
+                    Tmat = _etkf_sqrt_transform(U, d, N1, N1 + self.etkf_ridge * s2.max())
+                    w = (dy * r_inv) @ HA.T @ Pw
+                    if transforms is not None:
+                        transforms.append((t, w.detach().cpu(), Tmat.detach().cpu()))
+                    ensemble = mu + w @ A + Tmat @ A
+                    if self.etkf_additive > 0.0:
+                        ensemble += torch.randn_like(ensemble) * self.etkf_additive
+
+                # NaN safety after analysis
+                nan_mask = torch.isnan(ensemble).any(dim=-1)
+                if nan_mask.any():
+                    nan_hit = True
+                    ensemble = torch.nan_to_num(ensemble)
+                    mu_fix = torch.mean(ensemble, dim=0)
+                    ensemble[nan_mask] = mu_fix
+
+                ensemble = _relax_anomalies(ensemble, A, self.relax, self.relax_alpha)
+                mu = torch.mean(ensemble, dim=0)
+                ensemble = mu + self.inflation * (ensemble - mu)
+
+            analysis[t] = torch.mean(ensemble, dim=0).detach().cpu().numpy()
+            ens_var[t] = torch.var(ensemble, dim=0).detach().cpu().numpy()
+            ens_traj[:, t] = ensemble.detach().cpu().numpy()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        if transforms is not None:
+            self._transforms, self._nan_windows = [transforms], [nan_hit]
+        return BaselineResult(trajectory=analysis, rmse=rmse, ensemble=ens_traj, ensemble_variance=ens_var, es=(es_acc.es() if es_acc is not None else None))
+    def assimilate_batch(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> list:
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
+
+        B, num_steps, _ = observations.shape
+        N = self.N_ensemble
+        N1 = N - 1
+        H = self.obs_operator
+        od = H.obs_dim
+
+        if self.R_var_vec is not None:
+            r_sqrt = torch.tensor(np.sqrt(self.R_var_vec), dtype=torch.float32, device=self.device)
+            r_inv = 1.0 / torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device)
+        else:
+            r_sqrt = np.sqrt(self.R_var)
+            r_inv = 1.0 / self.R_var
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        if self.init_ensemble is not None:
+            ensemble = self.init_ensemble.unsqueeze(0).expand(B, N, self.state_dim).clone()
+        else:
+            ensemble = _init_bg_from_obs(_obs0_for_init(interp_obs[:, 0], self.init_fill), self.obs_operator, self.state_dim, self.noise_init_std, self.device).unsqueeze(1).repeat(1, N, 1)
+            noise = torch.randn_like(ensemble) * self.noise_init_std
+            if self.obs_operator.indices is not None:
+                noise_obs = torch.randn((B, N, od), device=self.device) * r_sqrt
+                noise[..., self.obs_operator.indices] = noise_obs
+            ensemble += noise
+
+        analysis = np.zeros((B, num_steps, self.state_dim))
+        ens_var = np.zeros((B, num_steps, self.state_dim))
+        analysis[:, 0] = torch.mean(ensemble, dim=1).cpu().numpy()
+        ens_var[:, 0] = torch.var(ensemble, dim=1).cpu().numpy()
+        ens_store = (np.zeros((B, self.N_ensemble, num_steps, self.state_dim), dtype=np.float32)
+                     if getattr(self, "store_ensemble", False) else None)
+        if ens_store is not None:
+            ens_store[:, :, 0] = ensemble.detach().cpu().numpy()
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == self.state_dim
+        ) else None
+        es_accs = (
+            [None] * B if ref_full is None
+            else [_ESAccumulator(num_steps, self.state_dim, N) for _ in range(B)]
+        )
+        crps_ref = (true_state.to(device=self.device, dtype=ensemble.dtype)
+                    if ref_full is not None else None)
+        crps_sum = _analysis_crps_step(ensemble, crps_ref[:, 0]) if crps_ref is not None else None
+        transforms = [[] for _ in range(B)] if getattr(self, "_record_transforms", False) else None
+        nan_hit = [False] * B
+
+        for t in range(1, num_steps):
+            W = forcing[:, t - 1]
+            B0, N, D = ensemble.shape
+            step_params = _expand_batch_params(params, B0, N)
+            ensemble = self.dynamics.step(
+                ensemble.reshape(B0 * N, D),
+                W.unsqueeze(1).expand(*((B0, N) + W.shape[1:])).reshape(B0 * N, *W.shape[1:]),
+                **step_params,
+            ).reshape(B0, N, D)
+            # NaN safety: replace blown-up ensemble members
+            nan_mask = torch.isnan(ensemble).any(dim=-1)
+            if nan_mask.any():
+                ensemble = torch.nan_to_num(ensemble)
+                mu_nan = torch.mean(ensemble, dim=1)
+                for b in range(B):
+                    if nan_mask[b].any():
+                        nan_hit[b] = True
+                        ensemble[b, nan_mask[b]] = mu_nan[b]
+            for b in range(B):
+                if es_accs[b] is not None:
+                    es_accs[b].step(ensemble[b], ref_full[b, t])
+
+            if obs_mask[:, t].any():
+                for b in range(B):
+                    if not obs_mask[b, t]:
+                        continue
+                    ens_b = ensemble[b]
+                    idx, od_t, loc_Lx, loc_Ly = self._per_time(t)
+                    y_t = observations[b, t]
+                    mu = torch.mean(ens_b, dim=0)
+                    A = ens_b - mu
+                    mu_obs = H(mu, index=t)
+                    HA = H(ens_b, index=t) - mu_obs.unsqueeze(0)
+                    dy = y_t - mu_obs
+                    seen = torch.isfinite(y_t)
+                    if not seen.all():
+                        if self.loc_radius is not None or self.loc_Lx_t is not None or self.R_var_vec is not None:
+                            raise NotImplementedError("missing obs channels: unlocalized ETKF with scalar R only")
+                        HA, dy = HA[:, seen], dy[seen]
+
+                    if (self.loc_radius is not None or self.loc_Lx_t is not None) and self.loc_mode == "ensrf":
+                        R_obs = (torch.diag(torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device))
+                                 if self.R_var_vec is not None
+                                 else torch.eye(od_t, device=self.device) * self.R_var)
+                        ens_b = _ensrf_localized_analysis(mu, A, HA, dy, loc_Lx, loc_Ly, R_obs,
+                                                          max(self.etkf_ridge, 0.0), N1)
+                        if self.etkf_additive > 0.0:
+                            ens_b = ens_b + torch.randn_like(ens_b) * self.etkf_additive
+                    elif self.loc_radius is not None or self.loc_Lx_t is not None:
+                        Pf_Ht = A.T @ HA
+                        H_Pf_Ht = HA.T @ HA
+                        loc_Pf_Ht = loc_Lx * Pf_Ht
+                        loc_H_Pf_Ht = loc_Ly * H_Pf_Ht
+                        if self.R_var_vec is not None:
+                            R_obs = torch.diag(torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device))
+                        else:
+                            R_obs = torch.eye(od_t, device=self.device) * self.R_var
+                        ridge = (1e-4 if self.etkf_ridge <= 0.0 else self.etkf_ridge) * loc_H_Pf_Ht.max()
+                        Ph = loc_H_Pf_Ht + R_obs + ridge * torch.eye(od_t, device=self.device)
+                        K = torch.linalg.lstsq(Ph, loc_Pf_Ht.T).solution.T
+                        mu = mu + K @ dy
+                        if self.loc_mode == "square_root":
+                            ens_b = mu.unsqueeze(0) + A - HA @ K.T
+                        else:
+                            for n in range(N):
+                                perturbed = y_t + torch.randn(od_t, device=self.device) * r_sqrt
+                                ens_b[n] += K @ (perturbed - H(ens_b[n], index=t))
+                        if self.etkf_additive > 0.0:
+                            ens_b = ens_b + torch.randn_like(ens_b) * self.etkf_additive
+                    else:
+                        HA_w = torch.nan_to_num(HA / r_sqrt)
+                        try:
+                            U, s, Vt = torch.linalg.svd(HA_w, full_matrices=False)
+                        except RuntimeError:
+                            U, s, Vt = torch.linalg.svd(HA_w.cpu(), full_matrices=False)
+                            U, s, Vt = U.to(HA.device), s.to(HA.device), Vt.to(HA.device)
+                        s2 = s ** 2
+                        d = s2 + N1 + self.etkf_ridge * s2.max()
+                        Pw = U @ torch.diag(1.0 / d) @ U.T
+                        Tmat = _etkf_sqrt_transform(U, d, N1, N1 + self.etkf_ridge * s2.max())
+                        w = (dy * r_inv) @ HA.T @ Pw
+                        if transforms is not None:
+                            transforms[b].append((t, w.detach().cpu(), Tmat.detach().cpu()))
+                        ens_b = mu + w @ A + Tmat @ A
+                        if self.etkf_additive > 0.0:
+                            ens_b += torch.randn_like(ens_b) * self.etkf_additive
+                    ens_b = _relax_anomalies(ens_b, A, self.relax, self.relax_alpha)
+                    mu = torch.mean(ens_b, dim=0)
+                    ensemble[b] = mu + self.inflation * (ens_b - mu)
+
+            analysis[:, t] = torch.mean(ensemble, dim=1).detach().cpu().numpy()
+            ens_var[:, t] = torch.var(ensemble, dim=1).detach().cpu().numpy()
+            if ens_store is not None:
+                ens_store[:, :, t] = ensemble.detach().cpu().numpy()
+            if crps_sum is not None:
+                crps_sum += _analysis_crps_step(ensemble, crps_ref[:, t])
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        crps_all = (crps_sum / num_steps).detach().cpu().numpy() if crps_sum is not None else None
+        if transforms is not None:
+            self._transforms, self._nan_windows = transforms, nan_hit
+        results = []
+        for b in range(B):
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
+            results.append(BaselineResult(
+                crps=(crps_all[b] if crps_all is not None else None),
+                trajectory=analysis[b], rmse=rmse_b,
+                ensemble=(ens_store[b] if ens_store is not None else np.zeros((N, num_steps, self.state_dim))),
+                ensemble_variance=ens_var[b],
+                es=(es_accs[b].es() if es_accs[b] is not None else None),
+            ))
+        return results
+
+
+def _etks_factor(w: torch.Tensor, Tmat: torch.Tensor, c: float = 1.0) -> torch.Tensor:
+    """Ensemble-space map G^(c) = 11ᵀ/N + (c 1wᵀ + T^(c)) (I − 11ᵀ/N) of one ETKF analysis.
+
+    ``c = 1`` is the analysis itself. ``c = λ^(−m)`` is the retrospective update of
+    a state separated from that analysis by m inflations, under the reading
+    "inflation ≈ model error independent of the earlier state": the mean
+    increment scales by c, the covariance reduction by c², i.e. T^(c) has
+    eigenvalues sqrt(1 − (1 − τ²) c²) on T's eigenvectors
+    (docs/plans/tech/l96_etks_smoother.md).
+    """
+    N = w.shape[0]
+    ones = torch.ones(N, dtype=w.dtype, device=w.device)
+    C = torch.full((N, N), 1.0 / N, dtype=w.dtype, device=w.device)
+    P = torch.eye(N, dtype=w.dtype, device=w.device) - C
+    if c == 1.0:
+        Tc = Tmat
+    else:
+        tau, V = torch.linalg.eigh(0.5 * (Tmat + Tmat.T))
+        tau = tau.clamp(0.0, 1.0)
+        Tc = V @ torch.diag(torch.sqrt((1.0 - (1.0 - tau ** 2) * c ** 2).clamp_min(0.0))) @ V.T
+    return C + (c * torch.outer(ones, w) + Tc) @ P
+
+
+def _etks_smooth(ensemble: np.ndarray, transforms: list, inflation: float,
+                 lag: int | None, retro_inflation: str) -> np.ndarray:
+    """Smooth a stored ETKF ensemble trajectory ``(N, T, D)`` (post-analysis,
+    post-inflation) with the recorded per-analysis ``(t, w, Tmat)``.
+
+    A state s between analyses t_{k-1} <= s < t_k is updated by the later
+    analyses k, ..., k + lag − 1 (all of them if ``lag`` is None). In
+    ``"correct"`` mode the factor of an analysis m inflations after s is scaled
+    by c = inflation^(−m), and the state at an analysis time itself is taken
+    before its inflation. States at and after the last analysis are unchanged.
+    """
+    X = torch.from_numpy(np.asarray(ensemble, dtype=np.float64))
+    out = X.clone()
+    times = [t for t, _, _ in transforms]
+    ws = [w.double() for _, w, _ in transforms]
+    Ts = [T.double() for _, _, T in transforms]
+    K = len(times)
+    N = X.shape[0]
+    correct = retro_inflation == "correct"
+
+    def product(k0: int, last: int, m0: int) -> torch.Tensor:
+        Pi = torch.eye(N, dtype=torch.float64)
+        for j in range(k0, last):
+            c = inflation ** -(j - k0 + m0) if correct else 1.0
+            Pi = _etks_factor(ws[j], Ts[j], c) @ Pi
+        return Pi
+
+    for k0 in range(K):
+        last = K if lag is None else min(K, k0 + lag)
+        if last <= k0:
+            continue
+        lo = 0 if k0 == 0 else times[k0 - 1]
+        hi = times[k0]
+        out[:, lo:hi] = torch.einsum("nm,mtd->ntd", product(k0, last, 0), X[:, lo:hi])
+        if correct and k0 > 0:
+            mu = X[:, lo].mean(0, keepdim=True)
+            pre_inflation = mu + (X[:, lo] - mu) / inflation
+            out[:, lo] = product(k0, last, 1) @ pre_inflation
+    return out.numpy().astype(np.float32)
+
+
+class EnKS(ETKF):
+    """Localized ensemble Kalman smoother on the exact localized EnSRF (``loc_mode="ensrf"``).
+
+    Runs the localized ETKF unchanged, records each analysis
+    (``_ensrf_localized_analysis(record=...)``) and applies it to the earlier
+    stored states within ``lag`` analyses (``_enks_smooth_localized``; all
+    earlier states if None). Inflation must be 1 and there must be no
+    additive noise, so each analysis is fully described by the record.
+    """
+
+    def __init__(self, *args, lag: int | None = None, taper_steps: float | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if taper_steps is not None and taper_steps <= 0:
+            raise ValueError(f"taper_steps must be > 0 or None, got {taper_steps}")
+        self.taper_steps = taper_steps
+        if self.loc_mode != "ensrf" or (self.loc_radius is None and self.loc_Lx_t is None):
+            raise NotImplementedError("EnKS needs the localized ETKF with loc_mode='ensrf'")
+        if self.inflation != 1.0 or self.etkf_additive > 0.0 or self.relax is not None:
+            raise NotImplementedError("EnKS needs inflation = 1, etkf_additive = 0 and no relaxation")
+        if lag is not None and lag < 1:
+            raise ValueError(f"lag must be >= 1 or None, got {lag}")
+        self.lag = lag
+
+    def assimilate(self, observations, obs_mask, forcing, true_state=None, **kwargs):
+        self._enks_record = []
+        try:
+            res = super().assimilate(observations, obs_mask, forcing, true_state=true_state, **kwargs)
+            records = self._enks_record
+        finally:
+            self._enks_record = None
+        ens = torch.from_numpy(np.asarray(res.ensemble, dtype=np.float32)).to(self.device)
+        ens = _enks_smooth_localized(ens, records, self.lag, self.N_ensemble - 1,
+                                     taper_steps=self.taper_steps)
+        ens_np = ens.cpu().numpy()
+        trajectory = ens_np.mean(0).astype(np.float64)
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, trajectory, getattr(self, "obs_operator", None))
+        rmse = np.sqrt(np.mean((trajectory - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=trajectory, rmse=rmse, ensemble=ens_np,
+                              ensemble_variance=ens_np.var(0, ddof=1))
+
+
+class ETKS(ETKF):
+    """Ensemble transform Kalman smoother on the unlocalised ETKF.
+
+    Runs the ETKF unchanged, records each analysis's ensemble-space transform,
+    and applies later transforms retrospectively to the stored ensemble
+    (``_etks_smooth``). Exact bookkeeping when the analysis is linear in
+    ensemble space: no localisation and no additive noise.
+
+    ``retro_inflation``: ``"correct"`` (default) treats inflation as model
+    error added after the earlier state; ``"none"`` applies the plain analysis
+    maps and over-corrects beyond a lag of 2 on L96, so it is limited to
+    ``lag <= 2``. Design and measurements: docs/plans/tech/l96_etks_smoother.md,
+    docs/results/l96_etks_prototype.md.
+
+    Windows where the ETKF's NaN guard replaced members are returned
+    unsmoothed (member correspondence is broken there) and listed in
+    ``self.unsmoothed_windows`` for the last call. ``es`` of a smoothed result
+    scores the smoothed ensemble at steps 1..T−1 (the filter's scores its
+    forecast ensemble).
+    """
+
+    def __init__(self, *args, lag: int | None = None, retro_inflation: str = "correct", **kwargs):
+        super().__init__(*args, **kwargs)
+        if retro_inflation not in ("correct", "none"):
+            raise ValueError(f"retro_inflation must be 'correct' or 'none', got {retro_inflation!r}")
+        if lag is not None and lag < 0:
+            raise ValueError(f"lag must be >= 0 or None, got {lag}")
+        if retro_inflation == "none" and (lag is None or lag > 2):
+            raise ValueError("retro_inflation='none' over-corrects beyond lag 2; use lag <= 2 or 'correct'")
+        if self.loc_radius is not None or self.loc_Lx_t is not None:
+            raise NotImplementedError("ETKS needs the unlocalised ETKF (ensemble-space analysis)")
+        if self.etkf_additive > 0.0:
+            raise NotImplementedError("ETKS needs etkf_additive = 0 (the analysis must be linear in ensemble space)")
+        if self.relax is not None:
+            raise NotImplementedError("ETKS does not support relaxation inflation")
+        self.lag = lag
+        self.retro_inflation = retro_inflation
+        self._record_transforms = True
+        self.store_ensemble = True
+        self.unsmoothed_windows: list[int] = []
+
+    def _smooth_result(self, result: BaselineResult, transforms: list, nan_hit: bool,
+                       ref: np.ndarray, has_truth: bool) -> BaselineResult:
+        if nan_hit:
+            return result
+        ens = _etks_smooth(result.ensemble, transforms, self.inflation, self.lag, self.retro_inflation)
+        ens_t = torch.from_numpy(ens)
+        trajectory = ens_t.double().mean(0).numpy()
+        rmse = np.sqrt(np.mean((trajectory - ref) ** 2, axis=0))
+        crps = es = None
+        if has_truth and ref.shape[-1] == self.state_dim:
+            ref_t = torch.from_numpy(np.asarray(ref, dtype=np.float32))
+            crps = _analysis_crps_step(ens_t.permute(1, 0, 2), ref_t).mean(0).numpy()
+            acc = _ESAccumulator(ens.shape[1], self.state_dim, ens.shape[0])
+            for t in range(1, ens.shape[1]):
+                acc.step(ens[:, t], ref[t])
+            es = acc.es()
+        return BaselineResult(trajectory=trajectory, rmse=rmse, ensemble=ens,
+                              ensemble_variance=ens_t.var(0).numpy(), es=es, crps=crps)
+
+    def _ref(self, observations, true_state, trajectory) -> np.ndarray:
+        base = observations if true_state is None else true_state
+        return _safe_ref(base.detach().cpu().numpy(), trajectory, getattr(self, "obs_operator", None))
+
+    def assimilate(self, observations, obs_mask, forcing, true_state=None, **kwargs) -> BaselineResult:
+        result = super().assimilate(observations, obs_mask, forcing, true_state=true_state, **kwargs)
+        self.unsmoothed_windows = [0] if self._nan_windows[0] else []
+        ref = self._ref(observations, true_state, result.trajectory)
+        return self._smooth_result(result, self._transforms[0], self._nan_windows[0], ref,
+                                   true_state is not None)
+
+    def assimilate_batch(self, observations, obs_mask, forcing, true_state=None, **kwargs) -> list:
+        results = super().assimilate_batch(observations, obs_mask, forcing, true_state=true_state, **kwargs)
+        self.unsmoothed_windows = [b for b, hit in enumerate(self._nan_windows) if hit]
+        out = []
+        for b, result in enumerate(results):
+            ref = self._ref(observations[b], None if true_state is None else true_state[b], result.trajectory)
+            out.append(self._smooth_result(result, self._transforms[b], self._nan_windows[b], ref,
+                                           true_state is not None))
+        return out
+
+
+class EnKF:
+    def __init__(
+        self,
+        N_ensemble: int = 30,
+        R_var: float = 0.5,
+        inflation: float = 1.0,
+        dt: float = 0.01,
+        device: torch.device = torch.device("cpu"),
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+        obs_operator: ObsOperator = None,
+        loc_radius: float = None,
+        NO: int = 8,
+        J: int = 4,
+        noise_init_std: float = 1.5,
+        R_var_vec: np.ndarray = None,
+        loc_Lx_t: list | None = None,
+        loc_Ly_t: list | None = None,
+        init_ensemble: torch.Tensor | None = None,
+        init_fill=None,
+        relax: str | None = None,
+        relax_alpha: float = 0.0,
+    ):
+        if relax not in RELAX_MODES:
+            raise ValueError(f"relax must be one of {RELAX_MODES}, got {relax!r}")
+        self.relax, self.relax_alpha = relax, relax_alpha
+        self.N_ensemble = N_ensemble
+        self.R_var = R_var
+        self.R_var_vec = R_var_vec
+        self.inflation = inflation
+        self.dt = dt
+        self.device = device
+        self.coupling_exponent = coupling_exponent
+        self.dynamics = dynamics
+        self.state_dim = dynamics.state_dim if dynamics else 3
+        self.obs_operator = obs_operator or ObsOperator(self.state_dim)
+        self.init_fill = init_fill
+        self.loc_radius = loc_radius
+        self.noise_init_std = noise_init_std
+        self.loc_Lx_t = loc_Lx_t
+        self.loc_Ly_t = loc_Ly_t
+        self.init_ensemble = init_ensemble
+        if loc_radius is not None and loc_Lx_t is None:
+            self.loc_Lx, self.loc_Ly = _build_loc_matrices(
+                self.state_dim, self.obs_operator, NO, J, loc_radius, device)
+
+    def _per_time(self, t: int) -> tuple:
+        # See ETKF._per_time's identical unification: idx.numel() (rather
+        # than the operator's precomputed constant obs_dim) also covers
+        # h-mode operators whose h_index_at returns a per-time-varying-
+        # length index (e.g. the combined psi1/psi2 obs-density streams) --
+        # falls back to the constant when idx is None, identical to every
+        # existing (constant-width) h-mode/index-mode operator.
+        idx = self.obs_operator.index_at(t)
+        od_t = idx.numel() if idx is not None else self.obs_operator.obs_dim
+        loc_Lx = self.loc_Lx_t[t] if self.loc_Lx_t is not None else getattr(
+            self, "loc_Lx", None)
+        loc_Ly = self.loc_Ly_t[t] if self.loc_Ly_t is not None else getattr(
+            self, "loc_Ly", None)
+        return idx, od_t, loc_Lx, loc_Ly
+
+    def assimilate(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> BaselineResult:
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
+
+        # obs_mask.shape[0] (not observations.shape[0]): see ETKF.assimilate's
+        # identical comment -- observations may be a variable-width list
+        # (combined multi-stream obs), obs_mask is always a proper tensor.
+        num_steps = obs_mask.shape[0]
+        H = self.obs_operator
+        if self.obs_operator.h_mode:
+            od = self.obs_operator.obs_dim
+        else:
+            od = H.obs_dim
+
+        if self.R_var_vec is not None:
+            r_sqrt = torch.tensor(np.sqrt(self.R_var_vec), dtype=torch.float32, device=self.device)
+        else:
+            r_sqrt = np.sqrt(self.R_var)
+
+        if self.init_ensemble is not None:
+            ensemble = self.init_ensemble.clone()
+        else:
+            interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+            ensemble = _init_bg_from_obs(interp_obs[0], self.obs_operator, self.state_dim, self.noise_init_std, self.device).unsqueeze(0).repeat(self.N_ensemble, 1)
+            noise = torch.randn_like(ensemble) * self.noise_init_std
+            if self.obs_operator.indices is not None:
+                noise_obs = torch.randn((self.N_ensemble, od), device=self.device) * r_sqrt
+                noise[..., self.obs_operator.indices] = noise_obs
+            ensemble += noise
+
+        analysis = np.zeros((num_steps, self.state_dim))
+        ens_var = np.zeros((num_steps, self.state_dim))
+        # Full per-member trajectory, see the matching ETKF.assimilate comment.
+        ens_traj = np.zeros((self.N_ensemble, num_steps, self.state_dim), dtype=np.float32)
+        analysis[0] = torch.mean(ensemble, dim=0).cpu().numpy()
+        ens_var[0] = torch.var(ensemble, dim=0).cpu().numpy()
+        ens_traj[:, 0] = ensemble.detach().cpu().numpy()
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == self.state_dim
+        ) else None
+        es_acc = _ESAccumulator(num_steps, self.state_dim, self.N_ensemble) if ref_full is not None else None
+
+        for t in range(1, num_steps):
+            W = forcing[t - 1]
+            ensemble = self.dynamics.step(ensemble, W, **params)
+            nan_mask = torch.isnan(ensemble).any(dim=-1)
+            if nan_mask.any():
+                ensemble = torch.nan_to_num(ensemble)
+                mu_nan = torch.mean(ensemble, dim=0)
+                ensemble[nan_mask] = mu_nan
+            if es_acc is not None:
+                es_acc.step(ensemble, ref_full[t])
+
+            if obs_mask[t]:
+                idx, od_t, loc_Lx, loc_Ly = self._per_time(t)
+                y_t = observations[t]
+                mean_e = torch.mean(ensemble, dim=0)
+                A = ensemble - mean_e
+                H_ens = H(ensemble, index=t)
+                H_mean_e = torch.mean(H_ens, dim=0)
+                HA = H_ens - H_mean_e.unsqueeze(0)
+                P_obs = (HA.T @ HA) / (self.N_ensemble - 1)
+                cross_cov = (A.T @ HA) / (self.N_ensemble - 1)
+                if self.loc_radius is not None or self.loc_Lx_t is not None:
+                    P_obs = loc_Ly * P_obs
+                    cross_cov = loc_Lx * cross_cov
+                R_obs = torch.eye(od_t, device=self.device) * self.R_var
+                if self.R_var_vec is not None:
+                    R_obs = torch.diag(torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device))
+                ridge = 1e-4 * torch.eye(od_t, device=self.device)
+                Ph = P_obs + R_obs + ridge
+                K = torch.linalg.lstsq(Ph, cross_cov.T).solution.T
+                for n in range(self.N_ensemble):
+                    perturbed = y_t + torch.randn(od_t, device=self.device) * r_sqrt
+                    ensemble[n] += K @ (perturbed - H(ensemble[n], index=t))
+
+                ensemble = _relax_anomalies(ensemble, A, self.relax, self.relax_alpha)
+                mean_e = torch.mean(ensemble, dim=0)
+                ensemble = mean_e + self.inflation * (ensemble - mean_e)
+                # NaN safety after analysis+inflation
+                nan_mask = torch.isnan(ensemble).any(dim=-1)
+                if nan_mask.any():
+                    ensemble = torch.nan_to_num(ensemble)
+
+            analysis[t] = torch.mean(ensemble, dim=0).detach().cpu().numpy()
+            ens_var[t] = torch.var(ensemble, dim=0).detach().cpu().numpy()
+            ens_traj[:, t] = ensemble.detach().cpu().numpy()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis, rmse=rmse, ensemble=ens_traj, ensemble_variance=ens_var, es=(es_acc.es() if es_acc is not None else None))
+
+    def assimilate_batch(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> list:
+        if self.relax is not None:
+            raise NotImplementedError("EnKF.assimilate_batch does not support relaxation inflation")
+        params = dict(sigma=sigma, rho=rho, beta=beta, c1=c1, **kwargs)
+
+        B, num_steps, _ = observations.shape
+        H = self.obs_operator
+        od = H.obs_dim
+
+        if self.R_var_vec is not None:
+            r_sqrt = torch.tensor(np.sqrt(self.R_var_vec), dtype=torch.float32, device=self.device)
+        else:
+            r_sqrt = np.sqrt(self.R_var)
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        if self.init_ensemble is not None:
+            ensemble = self.init_ensemble.unsqueeze(0).expand(B, self.N_ensemble, self.state_dim).clone()
+        else:
+            ensemble = _init_bg_from_obs(_obs0_for_init(interp_obs[:, 0], self.init_fill), self.obs_operator, self.state_dim, self.noise_init_std, self.device).unsqueeze(1).repeat(1, self.N_ensemble, 1)
+            noise = torch.randn_like(ensemble) * self.noise_init_std
+            if self.obs_operator.indices is not None:
+                noise_obs = torch.randn((B, self.N_ensemble, od), device=self.device) * r_sqrt
+                noise[..., self.obs_operator.indices] = noise_obs
+            ensemble += noise
+
+        analysis = np.zeros((B, num_steps, self.state_dim))
+        ens_var = np.zeros((B, num_steps, self.state_dim))
+        analysis[:, 0] = torch.mean(ensemble, dim=1).cpu().numpy()
+        ens_var[:, 0] = torch.var(ensemble, dim=1).cpu().numpy()
+        ens_store = (np.zeros((B, self.N_ensemble, num_steps, self.state_dim), dtype=np.float32)
+                     if getattr(self, "store_ensemble", False) else None)
+        if ens_store is not None:
+            ens_store[:, :, 0] = ensemble.detach().cpu().numpy()
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == self.state_dim
+        ) else None
+        es_accs = (
+            [None] * B if ref_full is None
+            else [_ESAccumulator(num_steps, self.state_dim, self.N_ensemble) for _ in range(B)]
+        )
+        crps_ref = (true_state.to(device=self.device, dtype=ensemble.dtype)
+                    if ref_full is not None else None)
+        crps_sum = _analysis_crps_step(ensemble, crps_ref[:, 0]) if crps_ref is not None else None
+
+        for t in range(1, num_steps):
+            W = forcing[:, t - 1]
+            B0, N, D = ensemble.shape
+            step_params = _expand_batch_params(params, B0, N)
+            ensemble = self.dynamics.step(
+                ensemble.reshape(B0 * N, D),
+                W.unsqueeze(1).expand(*((B0, N) + W.shape[1:])).reshape(B0 * N, *W.shape[1:]),
+                **step_params,
+            ).reshape(B0, N, D)
+            # NaN safety: replace any ensemble members that blew up
+            nan_mask_step = torch.isnan(ensemble).any(dim=-1)
+            if nan_mask_step.any():
+                mean_e_pre = torch.mean(ensemble, dim=1)
+                for b in range(B):
+                    if nan_mask_step[b].any():
+                        ensemble[b, nan_mask_step[b]] = mean_e_pre[b]
+            for b in range(B):
+                if es_accs[b] is not None:
+                    es_accs[b].step(ensemble[b], ref_full[b, t])
+
+            if obs_mask[:, t].any():
+                idx, od_t, loc_Lx, loc_Ly = self._per_time(t)
+
+                def _h(x):
+                    return x[..., idx] if idx is not None else H(x)
+                obs_b = obs_mask[:, t].nonzero(as_tuple=True)[0]
+                full_ensemble = ensemble
+                ensemble = full_ensemble[obs_b]
+                Bt = ensemble.shape[0]
+                y_t = observations[obs_b, t]
+                seen = torch.isfinite(y_t).to(y_t.dtype)
+                y_t = torch.nan_to_num(y_t)
+                mean_e = torch.mean(ensemble, dim=1)
+                A = ensemble - mean_e.unsqueeze(1)
+                H_ens = _h(ensemble)
+                H_mean_e = torch.mean(H_ens, dim=1)
+                HA = H_ens - H_mean_e.unsqueeze(1)
+                P_obs = (HA.transpose(1, 2) @ HA) / (self.N_ensemble - 1)
+                cross_cov = (A.transpose(1, 2) @ HA) / (self.N_ensemble - 1)
+                if self.loc_radius is not None or self.loc_Lx_t is not None:
+                    P_obs = loc_Ly.unsqueeze(0) * P_obs
+                    cross_cov = loc_Lx.unsqueeze(0) * cross_cov
+                R_obs = torch.eye(od_t, device=self.device).unsqueeze(0) * self.R_var
+                ridge = 1e-4 * torch.eye(od_t, device=self.device).unsqueeze(0)
+                P_obs = P_obs * seen.unsqueeze(-1) * seen.unsqueeze(-2)
+                cross_cov = cross_cov * seen.unsqueeze(-2)
+                R_obs = R_obs + torch.diag_embed(1.0 - seen)
+                Ph = P_obs + R_obs + ridge
+                # Use lstsq for numerical robustness with underdetermined systems
+                K = torch.linalg.lstsq(
+                    Ph, cross_cov.transpose(1, 2)
+                ).solution.transpose(1, 2)
+                for n in range(self.N_ensemble):
+                    perturbed = y_t + torch.randn((Bt, od_t), device=self.device) * np.sqrt(self.R_var)
+                    innov = (perturbed - _h(ensemble[:, n])) * seen
+                    ensemble[:, n] += (K @ innov.unsqueeze(-1)).squeeze(-1)
+
+                mean_e = torch.mean(ensemble, dim=1)
+                ensemble = mean_e.unsqueeze(1) + self.inflation * (ensemble - mean_e.unsqueeze(1))
+                nan_mask = torch.isnan(ensemble).any(dim=-1)
+                if nan_mask.any():
+                    ensemble = torch.nan_to_num(ensemble)
+                full_ensemble[obs_b] = ensemble
+                ensemble = full_ensemble
+
+            analysis[:, t] = torch.mean(ensemble, dim=1).detach().cpu().numpy()
+            ens_var[:, t] = torch.var(ensemble, dim=1).detach().cpu().numpy()
+            if ens_store is not None:
+                ens_store[:, :, t] = ensemble.detach().cpu().numpy()
+            if crps_sum is not None:
+                crps_sum += _analysis_crps_step(ensemble, crps_ref[:, t])
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        crps_all = (crps_sum / num_steps).detach().cpu().numpy() if crps_sum is not None else None
+        results = []
+        for b in range(B):
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
+            results.append(BaselineResult(
+                crps=(crps_all[b] if crps_all is not None else None),
+                trajectory=analysis[b], rmse=rmse_b,
+                ensemble=(ens_store[b] if ens_store is not None else np.zeros((self.N_ensemble, num_steps, self.state_dim))),
+                ensemble_variance=ens_var[b],
+                es=(es_accs[b].es() if es_accs[b] is not None else None),
+            ))
+        return results
+
+
+class JointWeak4DVar(Weak4DVar):
+    def __init__(
+        self,
+        da_window_steps: int = 300,
+        B_var: float = 2.0,
+        R_var: float = 0.5,
+        Q_var: float = 0.05,
+        P_var: float = 1.0,
+        lr: float = 0.02,
+        opt_steps: int = 150,
+        dt: float = 0.01,
+        device: torch.device = torch.device("cpu"),
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+    ):
+        super().__init__(
+            da_window_steps=da_window_steps,
+            B_var=B_var, R_var=R_var, Q_var=Q_var,
+            lr=lr, opt_steps=opt_steps, dt=dt,
+            device=device, coupling_exponent=coupling_exponent,
+            dynamics=dynamics,
+        )
+        self.P_var = P_var
+
+    def assimilate(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> BaselineResult:
+
+        num_steps = observations.shape[0]
+        sd = self.state_dim
+        num_windows = num_steps // self.da_window_steps
+        analysis = np.zeros((num_steps, sd))
+        param_arr = np.zeros((num_steps, 4))
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        current_bg = interp_obs[0].clone() + torch.randn(sd, device=self.device) * 1.5
+        log_s = torch.tensor(np.log(max(sigma, 1e-6)), device=self.device)
+        log_r = torch.tensor(np.log(max(rho, 1e-6)), device=self.device)
+        log_b = torch.tensor(np.log(max(beta, 1e-6)), device=self.device)
+        log_c = torch.tensor(np.log(max(c1, 1e-6)), device=self.device)
+        s_prior, r_prior, b_prior, c_prior = log_s, log_r, log_b, log_c
+
+        for w in range(num_windows):
+            start = w * self.da_window_steps
+            end = start + self.da_window_steps
+            win_obs = observations[start:end]
+            win_mask = obs_mask[start:end]
+            win_force = forcing[start:end]
+
+            x0_ctrl = current_bg.clone().detach().requires_grad_(True)
+            q_ctrl = torch.zeros(self.da_window_steps, sd, device=self.device, requires_grad=True)
+            ls = log_s.clone().detach().requires_grad_(True)
+            lr_ = log_r.clone().detach().requires_grad_(True)
+            lb = log_b.clone().detach().requires_grad_(True)
+            lc = log_c.clone().detach().requires_grad_(True)
+            x_bg_ref = current_bg.clone().detach()
+
+            opt = optim.Adam([x0_ctrl, q_ctrl, ls, lr_, lb, lc], lr=self.lr)
+
+            for _ in range(self.opt_steps):
+                opt.zero_grad()
+                s_val, r_val, b_val = torch.exp(ls), torch.exp(lr_), torch.exp(lb)
+                c_val = torch.exp(lc)
+                traj = self._forward_weak(x0_ctrl, q_ctrl, self.da_window_steps,
+                                          start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val)
+                J_b = torch.sum((x0_ctrl - x_bg_ref) ** 2) / self.B_var
+                J_q = torch.sum(q_ctrl ** 2) / self.Q_var
+                J_p = ((ls - s_prior) ** 2 + (lr_ - r_prior) ** 2 +
+                       (lb - b_prior) ** 2 + (lc - c_prior) ** 2) / self.P_var
+                J_o = torch.tensor(0.0, device=self.device)
+                for t in range(self.da_window_steps):
+                    if win_mask[t]:
+                        J_o += torch.sum((traj[t] - win_obs[t]) ** 2) / self.R_var
+                J_total = 0.5 * J_b + 0.5 * J_o + 0.5 * J_q + 0.1 * J_p
+                J_total.backward()
+                opt.step()
+
+            s_val, r_val, b_val = torch.exp(ls.detach()), torch.exp(lr_.detach()), torch.exp(lb.detach())
+            c_val = torch.exp(lc.detach())
+            final_traj = self._forward_weak(
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps,
+                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val
+            )
+            analysis[start:end] = final_traj.detach().cpu().numpy()
+            param_arr[start:end] = np.tile(
+                [float(s_val), float(r_val), float(b_val), float(c_val)], (self.da_window_steps, 1))
+            next_forecast = self._forward_weak(
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps,
+                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val
+            )
+            current_bg = next_forecast[-1].detach()
+            log_s, log_r, log_b, log_c = ls.detach(), lr_.detach(), lb.detach(), lc.detach()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr)
+
+    def assimilate_batch(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> list:
+
+        B, num_steps, _ = observations.shape
+        sd = self.state_dim
+        num_windows = num_steps // self.da_window_steps
+        analysis = np.zeros((B, num_steps, sd))
+        param_arr = np.zeros((B, num_steps, 4))
+
+        if isinstance(sigma, torch.Tensor) and sigma.dim() == 1:
+            sigma_b, rho_b, beta_b, c1_b = sigma, rho, beta, c1
+        else:
+            sigma_b = torch.full((B,), sigma, device=self.device)
+            rho_b = torch.full((B,), rho, device=self.device)
+            beta_b = torch.full((B,), beta, device=self.device)
+            c1_b = torch.full((B,), c1, device=self.device)
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        current_bg = interp_obs[:, 0].clone() + torch.randn(B, sd, device=self.device) * 1.5
+        log_s = torch.log(sigma_b.clamp(min=1e-6))
+        log_r = torch.log(rho_b.clamp(min=1e-6))
+        log_b = torch.log(beta_b.clamp(min=1e-6))
+        log_c = torch.log(c1_b.clamp(min=1e-6))
+        s_prior, r_prior, b_prior, c_prior = log_s.clone(), log_r.clone(), log_b.clone(), log_c.clone()
+
+        for w in range(num_windows):
+            start = w * self.da_window_steps
+            end = start + self.da_window_steps
+            win_obs = observations[:, start:end]
+            win_mask = obs_mask[:, start:end]
+            win_force = forcing[:, start:end]
+
+            x0_ctrl = current_bg.clone().detach().requires_grad_(True)
+            q_ctrl = torch.zeros(B, self.da_window_steps, sd, device=self.device, requires_grad=True)
+            ls = log_s.clone().detach().requires_grad_(True)
+            lr_ = log_r.clone().detach().requires_grad_(True)
+            lb = log_b.clone().detach().requires_grad_(True)
+            lc = log_c.clone().detach().requires_grad_(True)
+            x_bg_ref = current_bg.clone().detach()
+
+            opt = optim.Adam([x0_ctrl, q_ctrl, ls, lr_, lb, lc], lr=self.lr)
+
+            for _ in range(self.opt_steps):
+                opt.zero_grad()
+                s_val, r_val, b_val = torch.exp(ls), torch.exp(lr_), torch.exp(lb)
+                c_val = torch.exp(lc)
+                traj = self._forward_weak_batch(x0_ctrl, q_ctrl, self.da_window_steps,
+                                                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val)
+                J_b = torch.sum((x0_ctrl - x_bg_ref) ** 2) / self.B_var
+                J_q = torch.sum(q_ctrl ** 2) / self.Q_var
+                J_p = torch.sum((ls - s_prior) ** 2 + (lr_ - r_prior) ** 2 +
+                                (lb - b_prior) ** 2 + (lc - c_prior) ** 2) / self.P_var
+                diff = traj - win_obs
+                masked_diff = diff * win_mask.unsqueeze(-1)
+                J_o = torch.sum(masked_diff ** 2) / self.R_var
+                J_total = 0.5 * J_b + 0.5 * J_o + 0.5 * J_q + 0.1 * J_p
+                J_total.backward()
+                opt.step()
+
+            s_val, r_val, b_val = torch.exp(ls.detach()), torch.exp(lr_.detach()), torch.exp(lb.detach())
+            c_val = torch.exp(lc.detach())
+            final_traj = self._forward_weak_batch(
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps,
+                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val
+            )
+            analysis[:, start:end] = final_traj.detach().cpu().numpy()
+            param_arr[:, start:end] = torch.stack([s_val, r_val, b_val, c_val], dim=1).unsqueeze(1).expand(
+                B, self.da_window_steps, 4).detach().cpu().numpy()
+            next_forecast = self._forward_weak_batch(
+                x0_ctrl.detach(), q_ctrl.detach(), self.da_window_steps,
+                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val
+            )
+            current_bg = next_forecast[:, -1].detach()
+            log_s, log_r, log_b, log_c = ls.detach(), lr_.detach(), lb.detach(), lc.detach()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        results = []
+        for b in range(B):
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
+            results.append(BaselineResult(trajectory=analysis[b], rmse=rmse_b, params=param_arr[b]))
+        return results
+
+
+class JointStrong4DVar(Strong4DVar):
+    def __init__(
+        self,
+        da_window_steps: int = 300,
+        B_var: float = 2.0,
+        R_var: float = 0.5,
+        P_var: float = 1.0,
+        max_iter: int = 40,
+        lr: float = 0.1,
+        dt: float = 0.01,
+        device: torch.device = torch.device("cpu"),
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+    ):
+        super().__init__(
+            da_window_steps=da_window_steps,
+            B_var=B_var, R_var=R_var,
+            max_iter=max_iter, lr=lr, dt=dt,
+            device=device, coupling_exponent=coupling_exponent,
+            dynamics=dynamics,
+        )
+        self.P_var = P_var
+
+    def assimilate(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> BaselineResult:
+
+        num_steps = observations.shape[0]
+        sd = self.state_dim
+        num_windows = num_steps // self.da_window_steps
+        analysis = np.zeros((num_steps, sd))
+        param_arr = np.zeros((num_steps, 4))
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        current_bg = interp_obs[0].clone() + torch.randn(sd, device=self.device) * 1.5
+        log_s = torch.tensor(np.log(max(sigma, 1e-6)), device=self.device)
+        log_r = torch.tensor(np.log(max(rho, 1e-6)), device=self.device)
+        log_b = torch.tensor(np.log(max(beta, 1e-6)), device=self.device)
+        log_c = torch.tensor(np.log(max(c1, 1e-6)), device=self.device)
+        s_prior, r_prior, b_prior, c_prior = log_s, log_r, log_b, log_c
+
+        for w in range(num_windows):
+            start = w * self.da_window_steps
+            end = start + self.da_window_steps
+            win_obs = observations[start:end]
+            win_mask = obs_mask[start:end]
+            win_force = forcing[start:end]
+
+            x_ctrl = current_bg.clone().detach().requires_grad_(True)
+            ls = log_s.clone().detach().requires_grad_(True)
+            lr_ = log_r.clone().detach().requires_grad_(True)
+            lb = log_b.clone().detach().requires_grad_(True)
+            lc = log_c.clone().detach().requires_grad_(True)
+            x_bg_ref = current_bg.clone().detach()
+
+            opt = optim.Adam([x_ctrl, ls, lr_, lb, lc], lr=self.lr)
+
+            for _ in range(self.max_iter * 4):
+                opt.zero_grad()
+                s_val, r_val, b_val = torch.exp(ls), torch.exp(lr_), torch.exp(lb)
+                c_val = torch.exp(lc)
+                traj = self._forward_strong(x_ctrl, self.da_window_steps,
+                                            start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val)
+                J_b = torch.sum((x_ctrl - x_bg_ref) ** 2) / self.B_var
+                J_p = ((ls - s_prior) ** 2 + (lr_ - r_prior) ** 2 +
+                       (lb - b_prior) ** 2 + (lc - c_prior) ** 2) / self.P_var
+                J_o = torch.tensor(0.0, device=self.device)
+                for t in range(self.da_window_steps):
+                    if win_mask[t]:
+                        J_o += torch.sum((traj[t] - win_obs[t]) ** 2) / self.R_var
+                J_total = 0.5 * J_b + 0.5 * J_o + 0.1 * J_p
+                J_total.backward()
+                opt.step()
+
+            s_val, r_val, b_val = torch.exp(ls.detach()), torch.exp(lr_.detach()), torch.exp(lb.detach())
+            c_val = torch.exp(lc.detach())
+            final_traj = self._forward_strong(
+                x_ctrl.detach(), self.da_window_steps,
+                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val
+            )
+            analysis[start:end] = final_traj.detach().cpu().numpy()
+            param_arr[start:end] = np.tile(
+                [float(s_val), float(r_val), float(b_val), float(c_val)], (self.da_window_steps, 1))
+            current_bg = final_traj[-1].detach()
+            log_s, log_r, log_b, log_c = ls.detach(), lr_.detach(), lb.detach(), lc.detach()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr)
+
+    def assimilate_batch(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> list:
+
+        B, num_steps, _ = observations.shape
+        sd = self.state_dim
+        num_windows = num_steps // self.da_window_steps
+        analysis = np.zeros((B, num_steps, sd))
+        param_arr = np.zeros((B, num_steps, 4))
+
+        if isinstance(sigma, torch.Tensor) and sigma.dim() == 1:
+            sigma_b, rho_b, beta_b, c1_b = sigma, rho, beta, c1
+        else:
+            sigma_b = torch.full((B,), sigma, device=self.device)
+            rho_b = torch.full((B,), rho, device=self.device)
+            beta_b = torch.full((B,), beta, device=self.device)
+            c1_b = torch.full((B,), c1, device=self.device)
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        current_bg = interp_obs[:, 0].clone() + torch.randn(B, sd, device=self.device) * 1.5
+        log_s = torch.log(sigma_b.clamp(min=1e-6))
+        log_r = torch.log(rho_b.clamp(min=1e-6))
+        log_b = torch.log(beta_b.clamp(min=1e-6))
+        log_c = torch.log(c1_b.clamp(min=1e-6))
+        s_prior, r_prior, b_prior, c_prior = log_s.clone(), log_r.clone(), log_b.clone(), log_c.clone()
+
+        for w in range(num_windows):
+            start = w * self.da_window_steps
+            end = start + self.da_window_steps
+            win_obs = observations[:, start:end]
+            win_mask = obs_mask[:, start:end]
+            win_force = forcing[:, start:end]
+
+            x_ctrl = current_bg.clone().detach().requires_grad_(True)
+            ls = log_s.clone().detach().requires_grad_(True)
+            lr_ = log_r.clone().detach().requires_grad_(True)
+            lb = log_b.clone().detach().requires_grad_(True)
+            lc = log_c.clone().detach().requires_grad_(True)
+            x_bg_ref = current_bg.clone().detach()
+
+            opt = optim.Adam([x_ctrl, ls, lr_, lb, lc], lr=self.lr)
+
+            for _ in range(self.max_iter * 4):
+                opt.zero_grad()
+                s_val, r_val, b_val = torch.exp(ls), torch.exp(lr_), torch.exp(lb)
+                c_val = torch.exp(lc)
+                traj = self._forward_strong_batch(x_ctrl, self.da_window_steps,
+                                                  start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val)
+                J_b = torch.sum((x_ctrl - x_bg_ref) ** 2) / self.B_var
+                J_p = torch.sum((ls - s_prior) ** 2 + (lr_ - r_prior) ** 2 +
+                                (lb - b_prior) ** 2 + (lc - c_prior) ** 2) / self.P_var
+                diff = traj - win_obs
+                masked_diff = diff * win_mask.unsqueeze(-1)
+                J_o = torch.sum(masked_diff ** 2) / self.R_var
+                J_total = 0.5 * J_b + 0.5 * J_o + 0.1 * J_p
+                J_total.backward()
+                opt.step()
+
+            s_val, r_val, b_val = torch.exp(ls.detach()), torch.exp(lr_.detach()), torch.exp(lb.detach())
+            c_val = torch.exp(lc.detach())
+            final_traj = self._forward_strong_batch(
+                x_ctrl.detach(), self.da_window_steps,
+                start, win_force, sigma=s_val, rho=r_val, beta=b_val, c1=c_val
+            )
+            analysis[:, start:end] = final_traj.detach().cpu().numpy()
+            param_arr[:, start:end] = torch.stack([s_val, r_val, b_val, c_val], dim=1).unsqueeze(1).expand(
+                B, self.da_window_steps, 4).detach().cpu().numpy()
+            current_bg = final_traj[:, -1].detach()
+            log_s, log_r, log_b, log_c = ls.detach(), lr_.detach(), lb.detach(), lc.detach()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        results = []
+        for b in range(B):
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
+            results.append(BaselineResult(trajectory=analysis[b], rmse=rmse_b, params=param_arr[b]))
+        return results
+
+
+class JointEnKF(EnKF):
+    def __init__(
+        self,
+        N_ensemble: int = 30,
+        R_var: float = 0.5,
+        inflation: float = 1.0,
+        dt: float = 0.01,
+        device: torch.device = torch.device("cpu"),
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+    ):
+        super().__init__(
+            N_ensemble=N_ensemble, R_var=R_var, inflation=inflation,
+            dt=dt, device=device, coupling_exponent=coupling_exponent,
+            dynamics=dynamics,
+        )
+
+    def _init_ensemble(self, obs0, sigma, rho, beta, c1):
+        N = self.N_ensemble
+        state = obs0.clone().unsqueeze(0).repeat(N, 1)
+        state += torch.randn((N, self.state_dim), device=self.device) * 1.5
+        sigmas = torch.full((N, 1), sigma, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        rhos = torch.full((N, 1), rho, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        betas = torch.full((N, 1), beta, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        c1s = torch.full((N, 1), c1, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        return torch.cat([state, sigmas, rhos, betas, c1s], dim=1)
+
+    def _init_ensemble_batch(self, obs0, sigma, rho, beta, c1):
+        B = obs0.shape[0]
+        N = self.N_ensemble
+        state = obs0.clone().unsqueeze(1).repeat(1, N, 1)
+        state += torch.randn((B, N, self.state_dim), device=self.device) * 1.5
+        if isinstance(sigma, torch.Tensor) and sigma.dim() == 1:
+            sigmas = sigma.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            rhos = rho.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            betas = beta.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            c1s = c1.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+        else:
+            sigmas = torch.full((B, N, 1), sigma, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            rhos = torch.full((B, N, 1), rho, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            betas = torch.full((B, N, 1), beta, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            c1s = torch.full((B, N, 1), c1, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+        return torch.cat([state, sigmas, rhos, betas, c1s], dim=-1)
+
+    def assimilate(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> BaselineResult:
+
+        num_steps = observations.shape[0]
+        N = self.N_ensemble
+        N_dim = self.state_dim + 4
+        N1 = N - 1
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        ensemble = self._init_ensemble(interp_obs[0], sigma, rho, beta, c1)
+
+        sd = self.state_dim
+        analysis = np.zeros((num_steps, sd))
+        ens_var = np.zeros((num_steps, sd))
+        param_arr = np.zeros((num_steps, 4))
+        analysis[0] = torch.mean(ensemble[:, :sd], dim=0).cpu().numpy()
+        ens_var[0] = torch.var(ensemble[:, :sd], dim=0).cpu().numpy()
+        param_arr[0] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+
+        for t in range(1, num_steps):
+            W = forcing[t - 1]
+            sig_e = ensemble[:, 3].clamp(min=1e-6)
+            rho_e = ensemble[:, 4].clamp(min=1e-6)
+            beta_e = ensemble[:, 5].clamp(min=1e-6)
+            ensemble[:, :sd] = self.dynamics.step(ensemble[:, :sd], W.expand(N), sigma=sig_e, rho=rho_e, beta=beta_e)
+
+            if obs_mask[t]:
+                y_t = observations[t]
+                mean_e = torch.mean(ensemble, dim=0)
+                A = ensemble - mean_e
+                P_b = (A.T @ A) / N1
+                H = torch.zeros(sd, N_dim, device=self.device)
+                for i in range(sd):
+                    H[i, i] = 1.0
+                K = P_b @ H.T @ torch.inverse(H @ P_b @ H.T + torch.eye(sd, device=self.device) * self.R_var)
+                for n in range(N):
+                    perturbed = y_t + torch.randn(sd, device=self.device) * np.sqrt(self.R_var)
+                    ensemble[n] += K @ (perturbed - H @ ensemble[n])
+
+                mean_e = torch.mean(ensemble, dim=0)
+                ensemble = mean_e + self.inflation * (ensemble - mean_e)
+                ensemble[:, sd:] = ensemble[:, sd:].clamp(min=1e-6)
+                ensemble[:, 3] = ensemble[:, 3].clamp(max=30.0)
+                ensemble[:, 4] = ensemble[:, 4].clamp(max=50.0)
+                ensemble[:, 5] = ensemble[:, 5].clamp(max=10.0)
+                ensemble[:, 6] = ensemble[:, 6].clamp(max=5.0)
+
+            analysis[t] = torch.mean(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            ens_var[t] = torch.var(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            param_arr[t] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr,
+                              ensemble=np.zeros((N, num_steps, sd)),
+                              ensemble_variance=ens_var)
+
+    def assimilate_batch(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> list:
+
+        B, num_steps, _ = observations.shape
+        N = self.N_ensemble
+        sd = self.state_dim
+        N_dim = sd + 4
+        N1 = N - 1
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        ensemble = self._init_ensemble_batch(interp_obs[:, 0], sigma, rho, beta, c1)
+
+        analysis = np.zeros((B, num_steps, sd))
+        ens_var = np.zeros((B, num_steps, sd))
+        param_arr = np.zeros((B, num_steps, 4))
+        analysis[:, 0] = torch.mean(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        ens_var[:, 0] = torch.var(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        param_arr[:, 0] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
+
+        for t in range(1, num_steps):
+            W = forcing[:, t - 1, None]
+            sig_e = ensemble[:, :, 3].clamp(min=1e-6)
+            rho_e = ensemble[:, :, 4].clamp(min=1e-6)
+            beta_e = ensemble[:, :, 5].clamp(min=1e-6)
+            ensemble[:, :, :sd] = self.dynamics.step(ensemble[:, :, :sd], W.expand(B, -1), sigma=sig_e, rho=rho_e, beta=beta_e)
+
+            if obs_mask[:, t].any():
+                for b in range(B):
+                    if not obs_mask[b, t]:
+                        continue
+                    ens_b = ensemble[b]
+                    y_t = observations[b, t]
+                    mean_e = torch.mean(ens_b, dim=0)
+                    A = ens_b - mean_e
+                    P_b = (A.T @ A) / N1
+                    H = torch.zeros(sd, N_dim, device=self.device)
+                    for i in range(sd):
+                        H[i, i] = 1.0
+                    K = P_b @ H.T @ torch.inverse(H @ P_b @ H.T + torch.eye(sd, device=self.device) * self.R_var)
+                    for n in range(N):
+                        perturbed = y_t + torch.randn(sd, device=self.device) * np.sqrt(self.R_var)
+                        ens_b[n] += K @ (perturbed - H @ ens_b[n])
+                    mean_e = torch.mean(ens_b, dim=0)
+                    ensemble[b] = mean_e + self.inflation * (ens_b - mean_e)
+                    ensemble[b, :, sd:] = ensemble[b, :, sd:].clamp(min=1e-6)
+                    ensemble[b, :, 3] = ensemble[b, :, 3].clamp(max=30.0)
+                    ensemble[b, :, 4] = ensemble[b, :, 4].clamp(max=50.0)
+                    ensemble[b, :, 5] = ensemble[b, :, 5].clamp(max=10.0)
+                    ensemble[b, :, 6] = ensemble[b, :, 6].clamp(max=5.0)
+
+            analysis[:, t] = torch.mean(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            ens_var[:, t] = torch.var(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            param_arr[:, t] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
+        results = []
+        for b in range(B):
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
+            results.append(BaselineResult(
+                trajectory=analysis[b], rmse=rmse_b, params=param_arr[b],
+                ensemble=np.zeros((N, num_steps, sd)),
+                ensemble_variance=ens_var[b],
+            ))
+        return results
+
+
+class JointETKF(ETKF):
+    def __init__(
+        self,
+        N_ensemble: int = 30,
+        R_var: float = 0.5,
+        inflation: float = 1.0,
+        dt: float = 0.01,
+        device: torch.device = torch.device("cpu"),
+        coupling_exponent: float = 1.0,
+        dynamics: DynamicsBase = None,
+    ):
+        super().__init__(
+            N_ensemble=N_ensemble, R_var=R_var, inflation=inflation,
+            dt=dt, device=device, coupling_exponent=coupling_exponent,
+            dynamics=dynamics,
+        )
+
+    def assimilate(
+        self,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
+        forcing: torch.Tensor,
+        true_state: torch.Tensor = None,
+        sigma: float = 10.0,
+        rho: float = 28.0,
+        beta: float = 8 / 3,
+        c1: float = 1.0,
+            **kwargs,
+    ) -> BaselineResult:
+
+        num_steps = observations.shape[0]
+        N = self.N_ensemble
+        sd = self.state_dim
+        N_dim = sd + 4
+        N1 = N - 1
+        R_sym_sqrt_inv = 1.0 / np.sqrt(self.R_var)
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        state = interp_obs[0].clone().unsqueeze(0).repeat(N, 1)
+        state += torch.randn((N, sd), device=self.device) * 1.5
+        sigmas = torch.full((N, 1), sigma, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        rhos = torch.full((N, 1), rho, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        betas = torch.full((N, 1), beta, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        c1s = torch.full((N, 1), c1, device=self.device) * (1 + torch.randn(N, 1, device=self.device) * 0.1)
+        ensemble = torch.cat([state, sigmas, rhos, betas, c1s], dim=1)
+
+        analysis = np.zeros((num_steps, sd))
+        ens_var = np.zeros((num_steps, sd))
+        param_arr = np.zeros((num_steps, 4))
+        analysis[0] = torch.mean(ensemble[:, :sd], dim=0).cpu().numpy()
+        ens_var[0] = torch.var(ensemble[:, :sd], dim=0).cpu().numpy()
+        param_arr[0] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+
+        H_obs = torch.zeros(sd, N_dim, device=self.device)
+        for i in range(sd):
+            H_obs[i, i] = 1.0
+
+        for t in range(1, num_steps):
+            W = forcing[t - 1]
+            sig_e = ensemble[:, 3].clamp(min=1e-6)
+            rho_e = ensemble[:, 4].clamp(min=1e-6)
+            beta_e = ensemble[:, 5].clamp(min=1e-6)
+            ensemble[:, :sd] = self.dynamics.step(ensemble[:, :sd], W.unsqueeze(1).expand(N), sigma=sig_e, rho=rho_e, beta=beta_e)
 
             if obs_mask[t]:
                 y_t = observations[t]
                 mu = torch.mean(ensemble, dim=0)
                 A = ensemble - mu
-                Y = A
-                dy = y_t - mu
+                HA = A @ H_obs.T
+                Y = HA
+                dy = y_t - mu[:sd]
 
                 Y_w = Y * R_sym_sqrt_inv
-
                 U, s, Vt = torch.linalg.svd(Y_w, full_matrices=False)
                 s2 = s ** 2
                 d = s2 + N1
@@ -427,13 +2672,22 @@ class ETKF:
 
                 mu = torch.mean(ensemble, dim=0)
                 ensemble = mu + self.inflation * (ensemble - mu)
+                ensemble[:, sd:] = ensemble[:, sd:].clamp(min=1e-6)
+                ensemble[:, 3] = ensemble[:, 3].clamp(max=30.0)
+                ensemble[:, 4] = ensemble[:, 4].clamp(max=50.0)
+                ensemble[:, 5] = ensemble[:, 5].clamp(max=10.0)
+                ensemble[:, 6] = ensemble[:, 6].clamp(max=5.0)
 
-            analysis[t] = torch.mean(ensemble, dim=0).detach().cpu().numpy()
-            ens_var[t] = torch.var(ensemble, dim=0).detach().cpu().numpy()
+            analysis[t] = torch.mean(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            ens_var[t] = torch.var(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            param_arr[t] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
         rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
-        return BaselineResult(trajectory=analysis, rmse=rmse, ensemble=np.zeros((N, num_steps, 3)), ensemble_variance=ens_var)
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr,
+                              ensemble=np.zeros((N, num_steps, sd)),
+                              ensemble_variance=ens_var)
 
     def assimilate_batch(
         self,
@@ -445,29 +2699,48 @@ class ETKF:
         rho: float = 28.0,
         beta: float = 8 / 3,
         c1: float = 1.0,
+            **kwargs,
     ) -> list:
+
         B, num_steps, _ = observations.shape
         N = self.N_ensemble
+        sd = self.state_dim
+        N_dim = sd + 4
         N1 = N - 1
         R_sym_sqrt_inv = 1.0 / np.sqrt(self.R_var)
 
-        ensemble = observations[:, 0].clone().unsqueeze(1).repeat(1, N, 1)
-        ensemble += torch.randn((B, N, 3), device=self.device) * 1.5
+        interp_obs = _interp_observations(observations, obs_mask)
+        state = interp_obs[:, 0].clone().unsqueeze(1).repeat(1, N, 1)
+        state += torch.randn((B, N, sd), device=self.device) * 1.5
+        if isinstance(sigma, torch.Tensor) and sigma.dim() == 1:
+            sigmas = sigma.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            rhos = rho.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            betas = beta.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            c1s = c1.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+        else:
+            sigmas = torch.full((B, N, 1), sigma, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            rhos = torch.full((B, N, 1), rho, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            betas = torch.full((B, N, 1), beta, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+            c1s = torch.full((B, N, 1), c1, device=self.device) * (1 + torch.randn(B, N, 1, device=self.device) * 0.1)
+        ensemble = torch.cat([state, sigmas, rhos, betas, c1s], dim=-1)
 
-        analysis = np.zeros((B, num_steps, 3))
-        ens_var = np.zeros((B, num_steps, 3))
-        analysis[:, 0] = torch.mean(ensemble, dim=1).cpu().numpy()
-        ens_var[:, 0] = torch.var(ensemble, dim=1).cpu().numpy()
+        analysis = np.zeros((B, num_steps, sd))
+        ens_var = np.zeros((B, num_steps, sd))
+        param_arr = np.zeros((B, num_steps, 4))
+        analysis[:, 0] = torch.mean(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        ens_var[:, 0] = torch.var(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        param_arr[:, 0] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
+
+        H_obs = torch.zeros(1, sd, N_dim, device=self.device)
+        for i in range(sd):
+            H_obs[0, i, i] = 1.0
 
         for t in range(1, num_steps):
             W = forcing[:, t - 1, None]
-            Xe, Ye, Ze = ensemble[:, :, 0], ensemble[:, :, 1], ensemble[:, :, 2]
-            dX = sigma * (Ye - Xe) + _apply_coupling(W, c1, self.coupling_type)
-            dY = Xe * (rho - Ze) - Ye
-            dZ = Xe * Ye - beta * Ze
-            ensemble[:, :, 0] += dX * self.dt
-            ensemble[:, :, 1] += dY * self.dt
-            ensemble[:, :, 2] += dZ * self.dt
+            sig_e = ensemble[:, :, 3].clamp(min=1e-6)
+            rho_e = ensemble[:, :, 4].clamp(min=1e-6)
+            beta_e = ensemble[:, :, 5].clamp(min=1e-6)
+            ensemble[:, :, :sd] = self.dynamics.step(ensemble[:, :, :sd], W.expand(B, -1), sigma=sig_e, rho=rho_e, beta=beta_e)
 
             if obs_mask[:, t].any():
                 for b in range(B):
@@ -477,162 +2750,944 @@ class ETKF:
                     y_t = observations[b, t]
                     mu = torch.mean(ens_b, dim=0)
                     A = ens_b - mu
-                    Y = A
-                    dy = y_t - mu
+                    HA = A @ H_obs[0].T
+                    dy = y_t - mu[:sd]
 
-                    Y_w = Y * R_sym_sqrt_inv
-
-                    U, s, Vt = torch.linalg.svd(Y_w, full_matrices=False)
-                    s2 = s ** 2
+                    Y_w = HA * R_sym_sqrt_inv
+                    U, s_, Vt = torch.linalg.svd(Y_w, full_matrices=False)
+                    s2 = s_ ** 2
                     d = s2 + N1
 
                     Pw = U @ torch.diag(1.0 / d) @ U.T
                     T = U @ torch.diag(torch.sqrt(N1 / d)) @ U.T
 
                     R_inv = 1.0 / self.R_var
-                    w = (dy * R_inv) @ Y.T @ Pw
+                    w = (dy * R_inv) @ HA.T @ Pw
 
                     ens_b = mu + w @ A + T @ A
                     mu = torch.mean(ens_b, dim=0)
                     ensemble[b] = mu + self.inflation * (ens_b - mu)
+                    ensemble[b, :, sd:] = ensemble[b, :, sd:].clamp(min=1e-6)
+                    ensemble[b, :, 3] = ensemble[b, :, 3].clamp(max=30.0)
+                    ensemble[b, :, 4] = ensemble[b, :, 4].clamp(max=50.0)
+                    ensemble[b, :, 5] = ensemble[b, :, 5].clamp(max=10.0)
+                    ensemble[b, :, 6] = ensemble[b, :, 6].clamp(max=5.0)
 
-            analysis[:, t] = torch.mean(ensemble, dim=1).detach().cpu().numpy()
-            ens_var[:, t] = torch.var(ensemble, dim=1).detach().cpu().numpy()
+            analysis[:, t] = torch.mean(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            ens_var[:, t] = torch.var(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            param_arr[:, t] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, 'obs_operator', None))
         results = []
         for b in range(B):
             rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
             results.append(BaselineResult(
-                trajectory=analysis[b], rmse=rmse_b,
-                ensemble=np.zeros((N, num_steps, 3)),
+                trajectory=analysis[b], rmse=rmse_b, params=param_arr[b],
+                ensemble=np.zeros((N, num_steps, sd)),
                 ensemble_variance=ens_var[b],
             ))
         return results
 
 
-class EnKF:
-    def __init__(
-        self,
-        N_ensemble: int = 30,
-        R_var: float = 0.5,
-        inflation: float = 1.0,
-        dt: float = 0.01,
-        device: torch.device = torch.device("cpu"),
-        coupling_type: str = "linear",
-    ):
-        self.N_ensemble = N_ensemble
-        self.R_var = R_var
-        self.inflation = inflation
-        self.dt = dt
-        self.device = device
-        self.coupling_type = coupling_type
+# ===========================================================================
+# L96 joint state-parameter estimation
+# Estimates 8 params: F, c1, hx, eps + fast_weights (w1..w4). h is fixed.
+# Augmented state layout: [state(sd), F, c1, hx, eps, w1, w2, w3, w4]
+# ===========================================================================
 
-    def assimilate(
-        self,
-        observations: torch.Tensor,
-        obs_mask: torch.Tensor,
-        forcing: torch.Tensor,
-        true_state: torch.Tensor = None,
-        sigma: float = 10.0,
-        rho: float = 28.0,
-        beta: float = 8 / 3,
-        c1: float = 1.0,
-    ) -> BaselineResult:
+_L96_JOINT_PARAM_DIM = 8
+
+
+def _l96_h_fixed(N, device):
+    return torch.full((N,), 1.0, dtype=torch.float32, device=device)
+
+
+def _l96_joint_split(ensemble, sd, J):
+    F_e = ensemble[:, sd + 0].clamp(min=1e-6)
+    c1_e = ensemble[:, sd + 1].clamp(min=1e-6)
+    hx_e = ensemble[:, sd + 2].clamp(min=1e-6)
+    eps_e = ensemble[:, sd + 3].clamp(min=1e-6)
+    fw = ensemble[:, sd + 4:sd + 4 + J].clamp(min=1e-6)
+    return F_e, c1_e, hx_e, eps_e, fw
+
+
+def _l96_joint_obs_op(obs_operator, sd):
+    """Augmented observation operator: identity on state block, zero on params."""
+    if obs_operator.indices is None:
+        n_obs = sd
+        idx = list(range(sd))
+    else:
+        n_obs = obs_operator.indices.shape[0]
+        idx = obs_operator.indices.tolist()
+    return idx, n_obs
+
+
+class JointEnKFL96(EnKF):
+    """Joint EnKF for L96 estimating F, c1, hx, eps and fast_weights (h fixed).
+
+    Augmented state layout: ``[state(sd), F, c1, hx, eps, w1..wJ]`` where ``J`` is
+    the number of active fast weights (4 for the S0 full 40D dynamics, 2 for the S1
+    reduced 24D dynamics). The reported param vector is always 8-wide; on S1 the
+    unestimated ``w3,w4`` default to the reference prior ``[1.0, 0.1]``.
+    """
+
+    def __init__(self, N_ensemble=30, R_var=0.5, inflation=1.0, dt=0.001,
+                 device=torch.device("cpu"), coupling_exponent=1.0,
+                 dynamics=None, obs_operator=None, NO=8, J=4,
+                 noise_init_std=1.5, param_noise=0.1,
+                 h=None, fast_weights=None,
+                 etkf_ridge=0.0, loc_radius=None):
+        super().__init__(N_ensemble=N_ensemble, R_var=R_var, inflation=inflation,
+                         dt=dt, device=device, coupling_exponent=coupling_exponent,
+                         dynamics=dynamics, obs_operator=obs_operator,
+                         NO=NO, J=J, noise_init_std=noise_init_std,
+                         loc_radius=loc_radius)
+        self.J = J
+        self.param_noise = param_noise
+        self.etkf_ridge = etkf_ridge
+        self._fixed_h = 1.0 if h is None else h
+        self._init_fw = [1.0, 1.0, 0.1, 0.1] if fast_weights is None else list(fast_weights)
+        self._sd = self.state_dim
+        self.param_dim = _L96_JOINT_PARAM_DIM
+        self._n_scl = 4  # (F, c1, hx, eps)
+        self._n_active_fw = J
+        self._n_est = self._n_scl + J
+        self._aug_dim = self._sd + self._n_est
+        self._ref_fw = [1.0, 1.0, 0.1, 0.1]
+
+    def _init_ensemble(self, obs0, params):
+        N = self.N_ensemble
+        sd = self._sd
+        rn = torch.randn
+        state = obs0.clone().unsqueeze(0).repeat(N, 1)
+        state = state + torch.randn((N, sd), device=self.device) * self.noise_init_std
+        p = params
+        Fs = torch.full((N, 1), p["F"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        c1s = torch.full((N, 1), p["c1"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        hxs = torch.full((N, 1), p["hx"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        epss = torch.full((N, 1), p["eps"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        fw_full = p["fast_weights"]
+        if len(fw_full) > self.J:
+            fw_full = fw_full[:self.J]
+        fw0 = torch.tensor(fw_full, dtype=torch.float32, device=self.device)
+        fws = fw0.unsqueeze(0).repeat(N, 1) * (1 + rn(N, fw0.shape[0], device=self.device) * self.param_noise)
+        return torch.cat([state, Fs, c1s, hxs, epss, fws], dim=1)
+
+    def _obs_idx(self):
+        if self.obs_operator.indices is None:
+            return list(range(self._sd))
+        return self.obs_operator.indices.tolist()
+
+    def _mk_Hstate(self, idx, sd, N_dim):
+        H = torch.zeros(len(idx), N_dim, device=self.device)
+        for i, j in enumerate(idx):
+            H[i, j] = 1.0
+        return H
+
+    def _params_to_report(self, mean_est, num_steps):
+        """Return the 8-wide per-step param array (F,c1,hx,eps,w1..w4)."""
+        arr = np.zeros((num_steps, self.param_dim))
+        arr[:, :self._n_est] = mean_est
+        for k in range(self._n_est, self.param_dim):
+            arr[:, k] = self._ref_fw[k - self._n_scl]
+        return arr
+
+    def _forecast(self, ensemble, W):
+        """Advance only the state block of the augmented ensemble to the next step."""
+        N = ensemble.shape[0]
+        sd = self._sd
+        F_e, c1_e, hx_e, eps_e, fw = _l96_joint_split(ensemble, sd, self.J)
+        h_e = _l96_h_fixed(N, self.device) if self._fixed_h == 1.0 \
+            else torch.full((N,), self._fixed_h, device=self.device)
+        next_state = self.dynamics.step(ensemble[:, :sd], W.expand(N),
+                                        F=F_e, c1=c1_e, h=h_e, hx=hx_e, eps=eps_e,
+                                        fast_weights=fw)
+        return torch.cat([next_state, ensemble[:, sd:]], dim=1)
+
+    def _analysis(self, ensemble, y_t, idx, H):
+        N = ensemble.shape[0]
+        N1 = N - 1
+        mu = torch.mean(ensemble, dim=0)
+        A = ensemble - mu
+        HA = A @ H.T
+        dy = y_t - mu[idx]
+        R_inv = 1.0 / self.R_var
+        Y = HA * np.sqrt(R_inv)
+        U, s, _ = torch.linalg.svd(Y, full_matrices=False)
+        s2 = s ** 2
+        d = s2 + N1 + self.etkf_ridge * s2.max()
+        Pw = U @ torch.diag(1.0 / d) @ U.T
+        T = U @ torch.diag(torch.sqrt(N1 / d)) @ U.T
+        w = (dy * R_inv) @ HA.T @ Pw
+        return mu + w @ A + T @ A
+
+    def assimilate(self, observations, obs_mask, forcing, true_state=None, F=8.0,
+                   c1=1.0, h=1.0, hx=1.0, eps=0.1, fast_weights=None, **kwargs):
+        if fast_weights is None:
+            fast_weights = self._init_fw
+        params = {"F": F, "c1": c1, "hx": hx, "eps": eps, "fast_weights": fast_weights}
         num_steps = observations.shape[0]
-        ensemble = observations[0].clone().unsqueeze(0).repeat(self.N_ensemble, 1)
-        ensemble += torch.randn((self.N_ensemble, 3), device=self.device) * 1.5
+        N = self.N_ensemble
+        sd = self._sd
 
-        analysis = np.zeros((num_steps, 3))
-        ens_var = np.zeros((num_steps, 3))
-        analysis[0] = torch.mean(ensemble, dim=0).cpu().numpy()
-        ens_var[0] = torch.var(ensemble, dim=0).cpu().numpy()
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        if self.obs_operator.indices is not None:
+            full0 = self.obs_operator.expand_to_state(interp_obs[0], sd)
+        else:
+            full0 = interp_obs[0]
+        ensemble = self._init_ensemble(full0, params)
+
+        analysis = np.zeros((num_steps, sd))
+        ens_var = np.zeros((num_steps, sd))
+        param_arr = np.zeros((num_steps, self._n_est))
+        analysis[0] = torch.mean(ensemble[:, :sd], dim=0).cpu().numpy()
+        ens_var[0] = torch.var(ensemble[:, :sd], dim=0).cpu().numpy()
+        param_arr[0] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+
+        idx = self._obs_idx()
+        H = self._mk_Hstate(idx, sd, self._aug_dim)
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+        es_acc = _ESAccumulator(num_steps, sd, N) if ref_full is not None else None
 
         for t in range(1, num_steps):
             W = forcing[t - 1]
-            Xe, Ye, Ze = ensemble[:, 0], ensemble[:, 1], ensemble[:, 2]
-            dX = sigma * (Ye - Xe) + _apply_coupling(W, c1, self.coupling_type)
-            dY = Xe * (rho - Ze) - Ye
-            dZ = Xe * Ye - beta * Ze
-            ensemble[:, 0] += dX * self.dt
-            ensemble[:, 1] += dY * self.dt
-            ensemble[:, 2] += dZ * self.dt
+            ensemble = self._forecast(ensemble, W)
 
             if obs_mask[t]:
-                y_t = observations[t]
-                mean_e = torch.mean(ensemble, dim=0)
-                A = ensemble - mean_e
-                P_b = (A.T @ A) / (self.N_ensemble - 1)
-                R = torch.eye(3, device=self.device) * self.R_var
-                K = P_b @ torch.inverse(P_b + R)
-                for n in range(self.N_ensemble):
-                    perturbed = y_t + torch.randn(3, device=self.device) * np.sqrt(self.R_var)
-                    ensemble[n] += K @ (perturbed - ensemble[n])
+                ensemble = self._analysis(ensemble, observations[t], idx, H)
+                mu = torch.mean(ensemble, dim=0)
+                ensemble[:, :sd] = mu[:sd] + self.inflation * (ensemble[:, :sd] - mu[:sd])
+                ensemble[:, sd:] = ensemble[:, sd:].clamp(min=1e-6)
+                nan_mask = torch.isnan(ensemble).any(dim=-1)
+                if nan_mask.any():
+                    ensemble = torch.nan_to_num(ensemble)
+                    mu_fix = torch.mean(ensemble, dim=0)
+                    ensemble[nan_mask] = mu_fix
 
-                mean_e = torch.mean(ensemble, dim=0)
-                ensemble = mean_e + self.inflation * (ensemble - mean_e)
+            if es_acc is not None:
+                es_acc.step(ensemble[:, :sd], ref_full[t])
 
-            analysis[t] = torch.mean(ensemble, dim=0).detach().cpu().numpy()
-            ens_var[t] = torch.var(ensemble, dim=0).detach().cpu().numpy()
+            analysis[t] = torch.mean(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            ens_var[t] = torch.var(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            param_arr[t] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+        param_arr = self._params_to_report(param_arr, num_steps)
 
         ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, "obs_operator", None))
         rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
-        return BaselineResult(trajectory=analysis, rmse=rmse, ensemble=np.zeros((self.N_ensemble, num_steps, 3)), ensemble_variance=ens_var)
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr,
+                              ensemble=np.zeros((N, num_steps, sd)),
+                              ensemble_variance=ens_var,
+                              es=(es_acc.es() if es_acc is not None else None))
 
-    def assimilate_batch(
-        self,
-        observations: torch.Tensor,
-        obs_mask: torch.Tensor,
-        forcing: torch.Tensor,
-        true_state: torch.Tensor = None,
-        sigma: float = 10.0,
-        rho: float = 28.0,
-        beta: float = 8 / 3,
-        c1: float = 1.0,
-    ) -> list:
+    def assimilate_batch(self, observations, obs_mask, forcing, true_state=None,
+                         F=None, c1=None, hx=None, eps=None, fast_weights=None, **kwargs):
+        """Vectorized-batch joint EnKF over the augmented state.
+
+        ``F``/``c1``/``hx``/``eps`` are ``[B]`` tensors and ``fast_weights`` is
+        ``[B, da_J]`` (one per window, already sliced by the caller).
+        """
         B, num_steps, _ = observations.shape
-        ensemble = observations[:, 0].clone().unsqueeze(1).repeat(1, self.N_ensemble, 1)
-        ensemble += torch.randn((B, self.N_ensemble, 3), device=self.device) * 1.5
+        N = self.N_ensemble
+        sd = self._sd
+        n_est = self._n_est
+        device = self.device
 
-        analysis = np.zeros((B, num_steps, 3))
-        ens_var = np.zeros((B, num_steps, 3))
-        analysis[:, 0] = torch.mean(ensemble, dim=1).cpu().numpy()
-        ens_var[:, 0] = torch.var(ensemble, dim=1).cpu().numpy()
+        if F is None:
+            F = torch.full((B,), 8.0, device=device)
+        if c1 is None:
+            c1 = torch.full((B,), 1.0, device=device)
+        if hx is None:
+            hx = torch.full((B,), 1.0, device=device)
+        if eps is None:
+            eps = torch.full((B,), 0.1, device=device)
+        if fast_weights is None:
+            fast_weights = torch.tensor([self._init_fw] * B, device=device)
+        if fast_weights.shape[-1] > self.J:
+            fast_weights = fast_weights[:, :self.J]
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        full0 = interp_obs[:, 0]
+        if self.obs_operator.indices is not None:
+            full0 = self.obs_operator.expand_to_state(full0, sd)
+        ensemble = full0.unsqueeze(1).repeat(1, N, 1)
+        ensemble = ensemble + torch.randn_like(ensemble) * self.noise_init_std
+        rn = torch.randn
+        Fs = F.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        c1s = c1.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        hxs = hx.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        epss = eps.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        fw0 = fast_weights.unsqueeze(1).repeat(1, N, 1)
+        fws = fw0 * (1 + rn(B, N, self.J, device=device) * self.param_noise)
+        ensemble = torch.cat([
+            ensemble,
+            Fs.unsqueeze(-1), c1s.unsqueeze(-1), hxs.unsqueeze(-1), epss.unsqueeze(-1),
+            fws,
+        ], dim=-1)  # [B, N, sd + 4 + J]
+
+        analysis = np.zeros((B, num_steps, sd))
+        ens_var = np.zeros((B, num_steps, sd))
+        param_arr = np.zeros((B, num_steps, n_est))
+        analysis[:, 0] = torch.mean(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        ens_var[:, 0] = torch.var(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        param_arr[:, 0, :n_est] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
+
+        idx = self._obs_idx()
+        H = self._mk_Hstate(idx, sd, self._aug_dim)
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+        es_accs = (
+            [None] * B if ref_full is None
+            else [_ESAccumulator(num_steps, sd, N) for _ in range(B)]
+        )
 
         for t in range(1, num_steps):
-            W = forcing[:, t - 1, None]
-            Xe, Ye, Ze = ensemble[:, :, 0], ensemble[:, :, 1], ensemble[:, :, 2]
-            dX = sigma * (Ye - Xe) + _apply_coupling(W, c1, self.coupling_type)
-            dY = Xe * (rho - Ze) - Ye
-            dZ = Xe * Ye - beta * Ze
-            ensemble[:, :, 0] += dX * self.dt
-            ensemble[:, :, 1] += dY * self.dt
-            ensemble[:, :, 2] += dZ * self.dt
+            W = forcing[:, t - 1]  # [B]
+            for b in range(B):
+                ensemble[b] = self._forecast(ensemble[b], W[b])
+            nan_mask = torch.isnan(ensemble).any(dim=-1)
+            if nan_mask.any():
+                ensemble = torch.nan_to_num(ensemble)
+                mu_nan = torch.mean(ensemble, dim=1)
+                for b in range(B):
+                    if nan_mask[b].any():
+                        ensemble[b, nan_mask[b]] = mu_nan[b]
 
-            if obs_mask[:, t].any():
-                y_t = observations[:, t]
-                mean_e = torch.mean(ensemble, dim=1)
-                A = ensemble - mean_e.unsqueeze(1)
-                P_b = (A.transpose(1, 2) @ A) / (self.N_ensemble - 1)
-                R = torch.eye(3, device=self.device).unsqueeze(0) * self.R_var
-                K = P_b @ torch.inverse(P_b + R)
-                for n in range(self.N_ensemble):
-                    perturbed = y_t + torch.randn((B, 3), device=self.device) * np.sqrt(self.R_var)
-                    ensemble[:, n] += (K @ (perturbed - ensemble[:, n]).unsqueeze(-1)).squeeze(-1)
+            for b in range(B):
+                if obs_mask[b, t]:
+                    y_t = observations[b, t]
+                    new_ens = self._analysis(ensemble[b], y_t, idx, H)
+                    mu = torch.mean(new_ens, dim=0)
+                    new_ens[:, :sd] = mu[:sd] + self.inflation * (new_ens[:, :sd] - mu[:sd])
+                    new_ens[:, sd:] = new_ens[:, sd:].clamp(min=1e-6)
+                    ensemble[b] = new_ens
 
-                mean_e = torch.mean(ensemble, dim=1)
-                ensemble = mean_e.unsqueeze(1) + self.inflation * (ensemble - mean_e.unsqueeze(1))
+            for b in range(B):
+                if es_accs[b] is not None:
+                    es_accs[b].step(ensemble[b, :, :sd], ref_full[b, t])
 
-            analysis[:, t] = torch.mean(ensemble, dim=1).detach().cpu().numpy()
-            ens_var[:, t] = torch.var(ensemble, dim=1).detach().cpu().numpy()
+            analysis[:, t] = torch.mean(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            ens_var[:, t] = torch.var(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            param_arr[:, t, :n_est] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
 
-        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
         results = []
         for b in range(B):
-            rmse_b = np.sqrt(np.mean((analysis[b] - ref[b]) ** 2, axis=0))
+            ref = observations[b].cpu().numpy() if true_state is None else true_state[b].cpu().numpy()
+            ref = _safe_ref(ref, analysis[b], getattr(self, "obs_operator", None))
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref) ** 2, axis=0))
+            prms = self._params_to_report(param_arr[b], num_steps)
             results.append(BaselineResult(
-                trajectory=analysis[b], rmse=rmse_b,
-                ensemble=np.zeros((self.N_ensemble, num_steps, 3)),
+                trajectory=analysis[b], rmse=rmse_b, params=prms,
+                ensemble=np.zeros((N, num_steps, sd)),
                 ensemble_variance=ens_var[b],
+                es=(es_accs[b].es() if es_accs[b] is not None else None),
             ))
         return results
+
+
+class JointETKFL96(ETKF):
+    """Joint ETKF for L96 estimating F, c1, hx, eps and fast_weights (h fixed).
+
+    Augmented state layout: ``[state(sd), F, c1, hx, eps, w1..wJ]`` where ``J`` is
+    the number of active fast weights (4 for the S0 full 40D dynamics, 2 for the S1
+    reduced 24D dynamics). The reported param vector is always 8-wide; on S1 the
+    unestimated ``w3,w4`` default to the reference prior ``[1.0, 0.1]`` so the
+    param-RMSE table stays apples-to-apples with the 8-param neural models.
+    """
+
+    def __init__(self, N_ensemble=30, R_var=0.5, inflation=1.0, dt=0.001,
+                 device=torch.device("cpu"), coupling_exponent=1.0,
+                 dynamics=None, obs_operator=None, NO=8, J=4,
+                 noise_init_std=1.5, param_noise=0.1,
+                 h=None, fast_weights=None,
+                 etkf_ridge=0.0, etkf_additive=0.0, loc_radius=None, R_var_vec=None):
+        super().__init__(N_ensemble=N_ensemble, R_var=R_var, inflation=inflation,
+                         dt=dt, device=device, coupling_exponent=coupling_exponent,
+                         dynamics=dynamics, obs_operator=obs_operator,
+                         NO=NO, J=J, noise_init_std=noise_init_std,
+                         etkf_ridge=etkf_ridge, etkf_additive=etkf_additive,
+                         loc_radius=loc_radius, R_var_vec=R_var_vec)
+        self.J = J
+        self.param_noise = param_noise
+        self._fixed_h = 1.0 if h is None else h
+        self._init_fw = [1.0, 1.0, 0.1, 0.1] if fast_weights is None else list(fast_weights)
+        self._sd = self.state_dim
+        self.param_dim = _L96_JOINT_PARAM_DIM
+        self._n_scl = 4  # (F, c1, hx, eps)
+        self._n_active_fw = J
+        self._n_est = self._n_scl + J
+        self._aug_dim = self._sd + self._n_est
+        self._ref_fw = [1.0, 1.0, 0.1, 0.1]
+
+    def _init_ensemble(self, obs0, params):
+        N = self.N_ensemble
+        sd = self._sd
+        rn = torch.randn
+        state = obs0.clone().unsqueeze(0).repeat(N, 1)
+        state = state + torch.randn((N, sd), device=self.device) * self.noise_init_std
+        p = params
+        Fs = torch.full((N, 1), p["F"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        c1s = torch.full((N, 1), p["c1"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        hxs = torch.full((N, 1), p["hx"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        epss = torch.full((N, 1), p["eps"], device=self.device) * (1 + rn(N, 1, device=self.device) * self.param_noise)
+        fw_full = p["fast_weights"]
+        if len(fw_full) > self.J:
+            fw_full = fw_full[:self.J]
+        fw0 = torch.tensor(fw_full, dtype=torch.float32, device=self.device)
+        fws = fw0.unsqueeze(0).repeat(N, 1) * (1 + rn(N, fw0.shape[0], device=self.device) * self.param_noise)
+        return torch.cat([state, Fs, c1s, hxs, epss, fws], dim=1)
+
+    def _obs_idx(self):
+        if self.obs_operator.indices is None:
+            return list(range(self._sd))
+        return self.obs_operator.indices.tolist()
+
+    def _mk_Hstate(self, idx, sd, N_dim):
+        H = torch.zeros(len(idx), N_dim, device=self.device)
+        for i, j in enumerate(idx):
+            H[i, j] = 1.0
+        return H
+
+    def _params_to_report(self, mean_est, num_steps):
+        """Return the 8-wide per-step param array (F,c1,hx,eps,w1..w4).
+
+        ``mean_est`` has width ``self._n_est`` (4 + J). The trailing ``8 - J`` slots
+        (w3,w4 on S1) default to the reference fast weights.
+        """
+        arr = np.zeros((num_steps, self.param_dim))
+        arr[:, :self._n_est] = mean_est
+        for k in range(self._n_est, self.param_dim):
+            arr[:, k] = self._ref_fw[k - self._n_scl]
+        return arr
+
+    def _forecast(self, ensemble, W):
+        """Advance only the state block of the augmented ensemble to the next step."""
+        N = ensemble.shape[0]
+        sd = self._sd
+        F_e, c1_e, hx_e, eps_e, fw = _l96_joint_split(ensemble, sd, self.J)
+        h_e = _l96_h_fixed(N, self.device) if self._fixed_h == 1.0 \
+            else torch.full((N,), self._fixed_h, device=self.device)
+        next_state = self.dynamics.step(ensemble[:, :sd], W.expand(N),
+                                        F=F_e, c1=c1_e, h=h_e, hx=hx_e, eps=eps_e,
+                                        fast_weights=fw)
+        return torch.cat([next_state, ensemble[:, sd:]], dim=1)
+
+    def _analysis(self, ensemble, y_t, idx, H):
+        N = ensemble.shape[0]
+        N1 = N - 1
+        mu = torch.mean(ensemble, dim=0)
+        A = ensemble - mu
+        HA = A @ H.T
+        dy = y_t - mu[idx]
+        if self.R_var_vec is None:
+            R_inv = 1.0 / self.R_var
+            Y = HA * np.sqrt(R_inv)
+        else:
+            rv = torch.tensor(self.R_var_vec, dtype=torch.float32, device=self.device)
+            R_inv = 1.0 / rv
+            Y = HA * torch.sqrt(R_inv)
+        U, s, _ = torch.linalg.svd(Y, full_matrices=False)
+        s2 = s ** 2
+        d = s2 + N1 + self.etkf_ridge * s2.max()
+        Pw = U @ torch.diag(1.0 / d) @ U.T
+        T = U @ torch.diag(torch.sqrt(N1 / d)) @ U.T
+        w = (dy * R_inv) @ HA.T @ Pw
+        return mu + w @ A + T @ A
+
+    def assimilate(self, observations, obs_mask, forcing, true_state=None, F=8.0,
+                   c1=1.0, h=1.0, hx=1.0, eps=0.1, fast_weights=None, **kwargs):
+        if fast_weights is None:
+            fast_weights = self._init_fw
+        params = {"F": F, "c1": c1, "hx": hx, "eps": eps, "fast_weights": fast_weights}
+        num_steps = observations.shape[0]
+        N = self.N_ensemble
+        sd = self._sd
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        if self.obs_operator.indices is not None:
+            full0 = self.obs_operator.expand_to_state(interp_obs[0], sd)
+        else:
+            full0 = interp_obs[0]
+        ensemble = self._init_ensemble(full0, params)
+
+        analysis = np.zeros((num_steps, sd))
+        ens_var = np.zeros((num_steps, sd))
+        param_arr = np.zeros((num_steps, self._n_est))
+        analysis[0] = torch.mean(ensemble[:, :sd], dim=0).cpu().numpy()
+        ens_var[0] = torch.var(ensemble[:, :sd], dim=0).cpu().numpy()
+        param_arr[0] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+
+        idx = self._obs_idx()
+        H = self._mk_Hstate(idx, sd, self._aug_dim)
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+        es_acc = _ESAccumulator(num_steps, sd, N) if ref_full is not None else None
+
+        for t in range(1, num_steps):
+            W = forcing[t - 1]
+            ensemble = self._forecast(ensemble, W)
+
+            if obs_mask[t]:
+                ensemble = self._analysis(ensemble, observations[t], idx, H)
+                mu = torch.mean(ensemble, dim=0)
+                ensemble[:, :sd] = mu[:sd] + self.inflation * (ensemble[:, :sd] - mu[:sd])
+                ensemble[:, sd:] = ensemble[:, sd:].clamp(min=1e-6)
+                nan_mask = torch.isnan(ensemble).any(dim=-1)
+                if nan_mask.any():
+                    ensemble = torch.nan_to_num(ensemble)
+                    mu_fix = torch.mean(ensemble, dim=0)
+                    ensemble[nan_mask] = mu_fix
+
+            if es_acc is not None:
+                es_acc.step(ensemble[:, :sd], ref_full[t])
+
+            analysis[t] = torch.mean(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            ens_var[t] = torch.var(ensemble[:, :sd], dim=0).detach().cpu().numpy()
+            param_arr[t] = torch.mean(ensemble[:, sd:], dim=0).detach().cpu().numpy()
+        param_arr = self._params_to_report(param_arr, num_steps)
+
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, "obs_operator", None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr,
+                              ensemble=np.zeros((N, num_steps, sd)),
+                              ensemble_variance=ens_var,
+                              es=(es_acc.es() if es_acc is not None else None))
+
+    def assimilate_batch(self, observations, obs_mask, forcing, true_state=None,
+                         F=None, c1=None, hx=None, eps=None, fast_weights=None, **kwargs):
+        """Vectorized-batch joint ETKF over the augmented state.
+
+        ``F``/``c1``/``hx``/``eps`` are ``[B]`` tensors and ``fast_weights`` is
+        ``[B, da_J]`` (one per window, already sliced by the caller).
+        """
+        B, num_steps, _ = observations.shape
+        N = self.N_ensemble
+        sd = self._sd
+        n_est = self._n_est
+        device = self.device
+
+        if F is None:
+            F = torch.full((B,), 8.0, device=device)
+        if c1 is None:
+            c1 = torch.full((B,), 1.0, device=device)
+        if hx is None:
+            hx = torch.full((B,), 1.0, device=device)
+        if eps is None:
+            eps = torch.full((B,), 0.1, device=device)
+        if fast_weights is None:
+            fast_weights = torch.tensor([self._init_fw] * B, device=device)
+        if fast_weights.shape[-1] > self.J:
+            fast_weights = fast_weights[:, :self.J]
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        full0 = interp_obs[:, 0]
+        if self.obs_operator.indices is not None:
+            full0 = self.obs_operator.expand_to_state(full0, sd)
+        ensemble = full0.unsqueeze(1).repeat(1, N, 1)
+        ensemble = ensemble + torch.randn_like(ensemble) * self.noise_init_std
+        rn = torch.randn
+        Fs = F.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        c1s = c1.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        hxs = hx.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        epss = eps.unsqueeze(1).repeat(1, N) * (1 + rn(B, N, device=device) * self.param_noise)
+        fw0 = fast_weights.unsqueeze(1).repeat(1, N, 1)
+        fws = fw0 * (1 + rn(B, N, self.J, device=device) * self.param_noise)
+        ensemble = torch.cat([
+            ensemble,
+            Fs.unsqueeze(-1), c1s.unsqueeze(-1), hxs.unsqueeze(-1), epss.unsqueeze(-1),
+            fws,
+        ], dim=-1)  # [B, N, sd + 4 + J]
+
+        analysis = np.zeros((B, num_steps, sd))
+        ens_var = np.zeros((B, num_steps, sd))
+        param_arr = np.zeros((B, num_steps, n_est))
+        analysis[:, 0] = torch.mean(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        ens_var[:, 0] = torch.var(ensemble[:, :, :sd], dim=1).cpu().numpy()
+        param_arr[:, 0, :n_est] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
+
+        idx = self._obs_idx()
+        H = self._mk_Hstate(idx, sd, self._aug_dim)
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+        es_accs = (
+            [None] * B if ref_full is None
+            else [_ESAccumulator(num_steps, sd, N) for _ in range(B)]
+        )
+
+        for t in range(1, num_steps):
+            W = forcing[:, t - 1]  # [B]
+            for b in range(B):
+                ensemble[b] = self._forecast(ensemble[b], W[b])
+            nan_mask = torch.isnan(ensemble).any(dim=-1)
+            if nan_mask.any():
+                ensemble = torch.nan_to_num(ensemble)
+                mu_nan = torch.mean(ensemble, dim=1)
+                for b in range(B):
+                    if nan_mask[b].any():
+                        ensemble[b, nan_mask[b]] = mu_nan[b]
+
+            for b in range(B):
+                if obs_mask[b, t]:
+                    y_t = observations[b, t]
+                    new_ens = self._analysis(ensemble[b], y_t, idx, H)
+                    mu = torch.mean(new_ens, dim=0)
+                    new_ens[:, :sd] = mu[:sd] + self.inflation * (new_ens[:, :sd] - mu[:sd])
+                    new_ens[:, sd:] = new_ens[:, sd:].clamp(min=1e-6)
+                    ensemble[b] = new_ens
+
+            for b in range(B):
+                if es_accs[b] is not None:
+                    es_accs[b].step(ensemble[b, :, :sd], ref_full[b, t])
+
+            analysis[:, t] = torch.mean(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            ens_var[:, t] = torch.var(ensemble[:, :, :sd], dim=1).detach().cpu().numpy()
+            param_arr[:, t, :n_est] = torch.mean(ensemble[:, :, sd:], dim=1).detach().cpu().numpy()
+
+        results = []
+        for b in range(B):
+            ref = observations[b].cpu().numpy() if true_state is None else true_state[b].cpu().numpy()
+            ref = _safe_ref(ref, analysis[b], getattr(self, "obs_operator", None))
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref) ** 2, axis=0))
+            prms = self._params_to_report(param_arr[b], num_steps)
+            results.append(BaselineResult(
+                trajectory=analysis[b], rmse=rmse_b, params=prms,
+                ensemble=np.zeros((N, num_steps, sd)),
+                ensemble_variance=ens_var[b],
+                es=(es_accs[b].es() if es_accs[b] is not None else None),
+            ))
+        return results
+
+
+class JointStrong4DVarL96(Strong4DVar):
+    """Joint Strong-4DVar for L96 estimating F, c1, hx, eps and fast_weights (h fixed).
+
+    Optimizes per window the initial state x0 and log-params (F, c1, hx, eps,
+    w1..w4). h is held fixed at its user-provided value.
+    """
+
+    def __init__(self, da_window_steps=300, B_var=2.0, R_var=0.5, P_var=1.0,
+                 max_iter=40, lr=0.1, lr_param=None, param_clamp_span=None,
+                 dt=0.001, device=torch.device("cpu"),
+                 coupling_exponent=1.0, dynamics=None, obs_operator=None,
+                 h=None, J=4, fast_weights=None, param_prior_scale=1.0):
+        super().__init__(da_window_steps=da_window_steps, B_var=B_var, R_var=R_var,
+                         max_iter=max_iter, lr=lr, dt=dt, device=device,
+                         coupling_exponent=coupling_exponent, dynamics=dynamics,
+                         obs_operator=obs_operator)
+        self.P_var = P_var
+        self.J = J
+        self.param_prior_scale = param_prior_scale
+        self.lr_param = 0.1 * lr if lr_param is None else lr_param
+        self.param_clamp_span = 0.4054651081081644 if param_clamp_span is None else param_clamp_span
+        self._fixed_h = 1.0 if h is None else h
+        self._init_fw = [1.0, 1.0, 0.1, 0.1] if fast_weights is None else list(fast_weights)
+        self._sd = self.state_dim
+        self.param_dim = _L96_JOINT_PARAM_DIM
+        self._n_scl = 4  # (F, c1, hx, eps)
+        self._ref_fw = [1.0, 1.0, 0.1, 0.1]  # w3/w4 default on S1 (J=2), not estimated
+
+    def _params_to_report(self, mean_est, num_steps):
+        """Return the 8-wide per-step param array (F,c1,hx,eps,w1..w4).
+
+        ``mean_est`` is the estimated [F,c1,hx,eps,w1..wJ] block (J = active fast
+        weights); the unestimated w3/w4 (S1, J=2) default to the reference prior.
+        """
+        arr = np.zeros((num_steps, self.param_dim))
+        n_est = mean_est.shape[-1]
+        arr[:, :n_est] = mean_est
+        for k in range(n_est, self.param_dim):
+            arr[:, k] = self._ref_fw[k - self._n_scl]
+        return arr
+
+
+    def _forward_l96(self, x0, steps, win_force, F_v, c1_v, hx_v, eps_v, fw_v):
+        traj = [x0]
+        h_fixed = self._fixed_h
+        for t in range(1, steps):
+            s = traj[-1]
+            W = win_force[t - 1]
+            next_s = self.dynamics.step(s, W, F=F_v, c1=c1_v, h=h_fixed, hx=hx_v,
+                                        eps=eps_v, fast_weights=fw_v)
+            next_s = torch.clamp(next_s, -50.0, 50.0)
+            traj.append(next_s)
+        return torch.stack(traj)
+
+    def _forward_l96_batch(self, x0, steps, win_force, F_v, c1_v, hx_v, eps_v, fw_v):
+        traj = [x0]
+        h_fixed = self._fixed_h
+        for t in range(1, steps):
+            s = traj[-1]
+            W = win_force[:, t - 1]
+            next_s = self.dynamics.step(s, W, F=F_v, c1=c1_v, h=h_fixed, hx=hx_v,
+                                        eps=eps_v, fast_weights=fw_v)
+            next_s = torch.clamp(next_s, -50.0, 50.0)
+            traj.append(next_s)
+        return torch.stack(traj, dim=1)
+
+    def _prior_terms(self, logp, ref):
+        return torch.sum((logp - ref) ** 2) / self.P_var
+
+    def assimilate(self, observations, obs_mask, forcing, true_state=None, F=8.0,
+                   c1=1.0, h=1.0, hx=1.0, eps=0.1, fast_weights=None, **kwargs):
+        if fast_weights is None:
+            fast_weights = self._init_fw
+        self._fixed_h = h
+        num_steps = observations.shape[0]
+        sd = self._sd
+        nw = num_steps // self.da_window_steps
+        analysis = np.zeros((num_steps, sd))
+        fw_full = list(fast_weights)
+        if len(fw_full) > self.J:
+            fw_full = fw_full[:self.J]
+        n_est = self._n_scl + len(fw_full)
+        param_est = np.zeros((num_steps, n_est))
+
+        ref_full = true_state.detach().cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+        es_acc = _ESAccumulator(num_steps, sd, 1) if ref_full is not None else None
+
+        interp_obs = _interp_observations(observations.unsqueeze(0), obs_mask.unsqueeze(0))[0]
+        if self.obs_operator.indices is not None:
+            current_bg = self.obs_operator.expand_to_state(interp_obs[0], sd)
+        else:
+            current_bg = interp_obs[0]
+        current_bg = current_bg + torch.randn(sd, device=self.device) * 1.5
+
+        def L(x):
+            return torch.log(torch.clamp(x, min=1e-6))
+
+        log_F = L(torch.tensor(F, device=self.device)).detach().requires_grad_(True)
+        log_c1 = L(torch.tensor(c1, device=self.device)).detach().requires_grad_(True)
+        log_hx = L(torch.tensor(hx, device=self.device)).detach().requires_grad_(True)
+        log_eps = L(torch.tensor(eps, device=self.device)).detach().requires_grad_(True)
+        fw_t = torch.tensor(fw_full, dtype=torch.float32, device=self.device,
+                            requires_grad=True)
+        ref_logF, ref_logc1, ref_loghx, ref_logeps = log_F.detach(), log_c1.detach(), log_hx.detach(), log_eps.detach()
+        ref_fw = fw_t.detach().clone()
+
+        for w in range(nw):
+            start = w * self.da_window_steps
+            end = start + self.da_window_steps
+            win_obs = observations[start:end]
+            win_mask = obs_mask[start:end]
+            win_force = forcing[start:end]
+
+            x_ctrl = current_bg.clone().detach().requires_grad_(True)
+            x_bg_ref = current_bg.clone().detach()
+
+            lF = log_F.clone().detach().requires_grad_(True)
+            lc1 = log_c1.clone().detach().requires_grad_(True)
+            lhx = log_hx.clone().detach().requires_grad_(True)
+            leps = log_eps.clone().detach().requires_grad_(True)
+            lfw = fw_t.clone().detach().requires_grad_(True)
+
+            opt = optim.LBFGS([x_ctrl, lF, lc1, lhx, leps, lfw], max_iter=self.max_iter, lr=self.lr)
+
+            def closure():
+                opt.zero_grad()
+                F_v = torch.exp(lF)
+                c1_v = torch.exp(lc1)
+                hx_v = torch.exp(lhx)
+                eps_v = torch.exp(leps)
+                fw_v = torch.clamp(lfw, min=1e-6)
+                traj = self._forward_l96(x_ctrl, self.da_window_steps, win_force,
+                                         F_v, c1_v, hx_v, eps_v, fw_v)
+                J_b = torch.sum((x_ctrl - x_bg_ref) ** 2) / self.B_var
+                J_p = (self._prior_terms(lF, ref_logF) + self._prior_terms(lc1, ref_logc1)
+                       + self._prior_terms(lhx, ref_loghx) + self._prior_terms(leps, ref_logeps)
+                       + torch.sum((lfw - ref_fw) ** 2) / self.P_var)
+                J_o = torch.tensor(0.0, device=self.device)
+                for t in range(self.da_window_steps):
+                    if win_mask[t]:
+                        proj = self.obs_operator(traj[t])
+                        diff = (proj - win_obs[t])
+                        J_o += torch.sum(diff ** 2) / self.R_var
+                J_total = 0.5 * J_b + 0.5 * J_o + self.param_prior_scale * J_p
+                J_total.backward()
+                return J_total
+
+            for _ in range(4):
+                opt.step(closure)
+
+            F_v = torch.exp(lF.detach())
+            c1_v = torch.exp(lc1.detach())
+            hx_v = torch.exp(lhx.detach())
+            eps_v = torch.exp(leps.detach())
+            fw_v = torch.clamp(lfw.detach(), min=1e-6)
+            final_traj = self._forward_l96(x_ctrl.detach(), self.da_window_steps, win_force,
+                                           F_v, c1_v, hx_v, eps_v, fw_v)
+            analysis[start:end] = final_traj.detach().cpu().numpy()
+            est = torch.cat([F_v.reshape(1), c1_v.reshape(1), hx_v.reshape(1), eps_v.reshape(1), fw_v.reshape(-1)]).detach().cpu().numpy()
+            param_est[start:end] = np.tile(est, (self.da_window_steps, 1))
+            if es_acc is not None:
+                for t in range(start, end):
+                    es_acc.step(final_traj[t - start].reshape(1, -1), ref_full[t])
+            current_bg = final_traj[-1].detach()
+            log_F, log_c1, log_hx, log_eps = lF.detach(), lc1.detach(), lhx.detach(), leps.detach()
+            fw_t = lfw.detach()
+
+        param_arr = self._params_to_report(param_est, num_steps)
+        ref = observations.cpu().numpy() if true_state is None else true_state.cpu().numpy()
+        ref = _safe_ref(ref, analysis, getattr(self, "obs_operator", None))
+        rmse = np.sqrt(np.mean((analysis - ref) ** 2, axis=0))
+        return BaselineResult(trajectory=analysis, rmse=rmse, params=param_arr,
+                              es=(es_acc.es() if es_acc is not None else None))
+
+    def assimilate_batch(self, observations, obs_mask, forcing, true_state=None,
+                         F=None, c1=None, h=None, hx=None, eps=None,
+                         fast_weights=None, **kwargs):
+        """Batched joint Strong-4DVar over the augmented (state + log-params) control.
+
+        Mirrors ``Strong4DVar.assimilate_batch``: a fixed-iteration Adam solve over
+        all ``B`` windows at once (no LBFGS / line search). ``F``/``c1``/``hx``/``eps``
+        are ``[B]`` tensors and ``fast_weights`` is ``[B, da_J]`` (one per window,
+        already sliced by the caller). Each window's x0 and log-params are optimized
+        jointly over every assimilation window. Parameter stability is enforced by
+        (1) a separate smaller learning rate ``self.lr_param`` on the log-param
+        groups, (2) a hard log-space envelope clamp around each window's reference,
+        and (3) a gradient-norm cap — together these keep ``exp()`` finite and the
+        parameters from drifting to overflow (the batch-Adam NaN of the prior
+        implementation).
+        """
+        B, num_steps, _ = observations.shape
+        if true_state is not None and not torch.is_tensor(true_state):
+            true_state = torch.as_tensor(true_state, device=observations.device)
+        sd = self._sd
+        nw = num_steps // self.da_window_steps
+        device = self.device
+
+        if F is None:
+            F = torch.full((B,), 8.0, device=device)
+        if c1 is None:
+            c1 = torch.full((B,), 1.0, device=device)
+        if h is None:
+            h = torch.full((B,), 1.0, device=device)
+        if hx is None:
+            hx = torch.full((B,), 1.0, device=device)
+        if eps is None:
+            eps = torch.full((B,), 0.1, device=device)
+        if fast_weights is None:
+            fast_weights = torch.tensor([self._init_fw] * B, device=device)
+        if fast_weights.shape[-1] > self.J:
+            fast_weights = fast_weights[..., :self.J]
+        n_est = self._n_scl + fast_weights.shape[-1]
+        self._fixed_h = float(h.reshape(-1)[0].item()) if h.dim() else float(h.item())
+
+        analysis = np.zeros((B, num_steps, sd))
+        param_est = np.zeros((B, num_steps, n_est))
+
+        ref_full = true_state.cpu().numpy() if (
+            true_state is not None and true_state.shape[-1] == sd
+        ) else None
+
+        interp_obs = _interp_observations(observations, obs_mask)
+        current_bg = interp_obs[:, 0]
+        if self.obs_operator.indices is not None:
+            current_bg = self.obs_operator.expand_to_state(current_bg, sd)
+        current_bg = current_bg + torch.randn(B, sd, device=device) * 1.5
+
+        def Lv(x):
+            return torch.log(torch.clamp(x, min=1e-6))
+
+        log_F = Lv(F).detach().requires_grad_(True)
+        log_c1 = Lv(c1).detach().requires_grad_(True)
+        log_hx = Lv(hx).detach().requires_grad_(True)
+        log_eps = Lv(eps).detach().requires_grad_(True)
+        fw_t = fast_weights.clone().detach().requires_grad_(True)
+        ref_logF, ref_logc1, ref_loghx, ref_logeps = (
+            log_F.detach(), log_c1.detach(), log_hx.detach(), log_eps.detach())
+        ref_fw = fw_t.detach().clone()
+        clamp = self.param_clamp_span
+
+        for w in range(nw):
+            start = w * self.da_window_steps
+            end = start + self.da_window_steps
+            win_obs = observations[:, start:end]
+            win_mask = obs_mask[:, start:end]
+            win_force = forcing[:, start:end]
+
+            x_ctrl = current_bg.clone().detach().requires_grad_(True)
+            x_bg_ref = current_bg.clone().detach()
+
+            lF = log_F.clone().detach().requires_grad_(True)
+            lc1 = log_c1.clone().detach().requires_grad_(True)
+            lhx = log_hx.clone().detach().requires_grad_(True)
+            leps = log_eps.clone().detach().requires_grad_(True)
+            lfw = fw_t.clone().detach().requires_grad_(True)
+            param_list = [lF, lc1, lhx, leps, lfw]
+
+            opt = optim.Adam([
+                {"params": [x_ctrl], "lr": self.lr},
+                {"params": param_list, "lr": self.lr_param},
+            ])
+            refs = [ref_logF, ref_logc1, ref_loghx, ref_logeps]
+
+            for _ in range(self.max_iter * 4):
+                opt.zero_grad()
+                F_v = torch.exp(lF)
+                c1_v = torch.exp(lc1)
+                hx_v = torch.exp(lhx)
+                eps_v = torch.exp(leps)
+                fw_v = torch.clamp(lfw, min=1e-6)
+                traj = self._forward_l96_batch(x_ctrl, self.da_window_steps, win_force,
+                                               F_v, c1_v, hx_v, eps_v, fw_v)
+                J_b = torch.sum((x_ctrl - x_bg_ref) ** 2) / self.B_var
+                J_p = sum(self._prior_terms(p, r) for p, r in zip(param_list, refs)) \
+                    + torch.sum((lfw - ref_fw) ** 2) / self.P_var
+                diff = self.obs_operator(traj) - torch.nan_to_num(win_obs, nan=0.0)
+                masked_diff = diff * win_mask.unsqueeze(-1)
+                J_o = torch.sum(masked_diff ** 2) / self.R_var
+                J_total = 0.5 * J_b + 0.5 * J_o + self.param_prior_scale * J_p
+                J_total.backward()
+                torch.nn.utils.clip_grad_norm_([x_ctrl] + param_list, max_norm=100.0)
+                opt.step()
+                for p, r in zip(param_list, refs):
+                    with torch.no_grad():
+                        p.clamp_(r - clamp, r + clamp)
+                with torch.no_grad():
+                    lfw.clamp_(ref_fw - clamp, ref_fw + clamp)
+
+            F_v = torch.exp(lF.detach())
+            c1_v = torch.exp(lc1.detach())
+            hx_v = torch.exp(lhx.detach())
+            eps_v = torch.exp(leps.detach())
+            fw_v = torch.clamp(lfw.detach(), min=1e-6)
+            with torch.no_grad():
+                final_traj = self._forward_l96_batch(
+                    x_ctrl.detach(), self.da_window_steps, win_force,
+                    F_v, c1_v, hx_v, eps_v, fw_v)
+            analysis[:, start:end] = final_traj.detach().cpu().numpy()
+            est = torch.cat([F_v.reshape(B, 1), c1_v.reshape(B, 1), hx_v.reshape(B, 1),
+                             eps_v.reshape(B, 1), fw_v.reshape(B, -1)], dim=-1)
+            param_est[:, start:end] = est.detach().cpu().numpy()[:, None, :].repeat(
+                self.da_window_steps, axis=1)
+            current_bg = final_traj[:, -1].detach()
+            log_F, log_c1, log_hx, log_eps = lF.detach(), lc1.detach(), lhx.detach(), leps.detach()
+            fw_t = lfw.detach()
+
+        results = []
+        for b in range(B):
+            ref = observations[b].cpu().numpy() if true_state is None else true_state[b].cpu().numpy()
+            ref = _safe_ref(ref, analysis[b], getattr(self, "obs_operator", None))
+            rmse_b = np.sqrt(np.mean((analysis[b] - ref) ** 2, axis=0))
+            es_b = (
+                np.mean(np.abs(analysis[b] - ref_full[b]), axis=0)
+                if ref_full is not None else None
+            )
+            prms = self._params_to_report(param_est[b], num_steps)
+            results.append(BaselineResult(trajectory=analysis[b], rmse=rmse_b,
+                                          params=prms, es=es_b))
+        return results
+

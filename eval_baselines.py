@@ -44,16 +44,16 @@ def main(cfg: DictConfig):
     datasets_cache = os.path.join(EXP_DIR, "datasets.pt")
     if os.path.exists(datasets_cache):
         t0 = time.time()
-        datasets = torch.load(datasets_cache)
+        datasets = torch.load(datasets_cache, weights_only=False)
         print(f"Loaded cached datasets in {time.time()-t0:.1f}s")
     else:
         t0 = time.time()
-        datasets = make_mixed_datasets(base_cfg)
+        datasets = make_mixed_datasets(base_cfg, include_sparse_obs_test=True)
         print(f"Datasets generated in {time.time()-t0:.1f}s")
         torch.save(datasets, datasets_cache)
     total_train = len(datasets["train_cs1"]) + len(datasets["train_cs2"])
     total_val = len(datasets["val_cs1"]) + len(datasets["val_cs2"])
-    total_test = len(datasets["test_cs1"]) + len(datasets["test_cs2"])
+    total_test = sum(len(datasets[k]) for k in datasets if k.startswith("test_"))
     print(f"  train={total_train}, val={total_val}, test={total_test}")
 
     # Read baseline config

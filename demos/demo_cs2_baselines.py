@@ -76,7 +76,7 @@ def run_baselines(window, cfg):
     )
     
     print(f"   - Parameters: σ={sigma:.2f}, ρ={rho:.2f}, β={beta:.4f} (BIASED by {cfg.param_bias*100:.0f}%)")
-    print(f"   - Forcing: Corrupted (OU process)")
+    print("   - Forcing: Corrupted (OU process)")
     
     # Run Weak-4DVar
     print("   - Running Weak-4DVar...")
@@ -198,8 +198,7 @@ def plot_forcing_impact(window, results, cfg, save_path):
                  label='Strong-4DVar Reconstruction', alpha=0.8)
     
     # Shade error regions
-    error = results['strong'].trajectory[:, 0] - true_state[:, 0]
-    axes[1].fill_between(time_grid, true_state[:, 0], 
+    axes[1].fill_between(time_grid, true_state[:, 0],
                           results['strong'].trajectory[:, 0], 
                           alpha=0.3, color='red', label='Reconstruction Error')
     
@@ -292,13 +291,13 @@ def main():
     dataset = Lorenz63Dataset(cfg)
     window = dataset[0]
     
-    print(f"   - Case: 2 (corrupted forcing, biased parameters)")
+    print("   - Case: 2 (corrupted forcing, biased parameters)")
     print(f"   - Parameter bias: {args.bias*100:.0f}%")
     print(f"   - Window size: {cfg.num_steps} steps ({args.duration}s)")
     print(f"   - Observations: {window['obs_mask'].sum().item()} sparse samples")
     
     # Run baseline methods
-    print(f"\n[2/4] Running baseline DA methods with biased parameters...")
+    print("\n[2/4] Running baseline DA methods with biased parameters...")
     results = run_baselines(window, cfg)
     
     # Print RMSE table
@@ -308,7 +307,7 @@ def main():
     save_results_table(results, 'outputs/results/cs2_rmse_table.txt')
     
     # Plot reconstruction
-    print(f"\n[3/4] Creating reconstruction visualization...")
+    print("\n[3/4] Creating reconstruction visualization...")
     plot_reconstruction(
         window,
         results,
@@ -317,7 +316,7 @@ def main():
     )
     
     # Plot forcing impact
-    print(f"\n[4/4] Creating forcing corruption impact visualization...")
+    print("\n[4/4] Creating forcing corruption impact visualization...")
     plot_forcing_impact(
         window,
         results,

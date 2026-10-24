@@ -1,4 +1,5 @@
 #!/bin/bash
+# DEPRECATED: Use batch/run_new_experiments.sbatch instead (same experiments, updated config).
 #SBATCH --account=odyssey
 #SBATCH --partition=Odyssey_GPU
 #SBATCH --gres=gpu:rtx8000:1
@@ -14,8 +15,8 @@ set -euo pipefail
 
 cd /Odyssey/private/rfablet/Python/4dvarnet-fm-opencode
 
-export PATH="/Odyssey/private/rfablet/miniforge3/envs/fdv/bin:$PATH"
-export CONDA_DEFAULT_ENV=fdv
+export PATH="/Odyssey/private/rfablet/miniforge3/envs/fdv-monai-proto/bin:$PATH"
+export CONDA_DEFAULT_ENV=fdv-monai-proto
 export PYTHONUNBUFFERED=1
 
 EXPERIMENTS=(

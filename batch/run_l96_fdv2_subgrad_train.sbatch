@@ -1,0 +1,52 @@
+#!/bin/bash
+#SBATCH --account=odyssey
+#SBATCH --partition=Odyssey_GPU
+#SBATCH --gres=gpu:rtx8000:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=24:00:00
+#SBATCH --job-name=l96-fdv2-subgrad
+#SBATCH --output=sbatch_logs/l96_fdv2_subgrad_train_%j.out
+#SBATCH --error=sbatch_logs/l96_fdv2_subgrad_train_%j.err
+
+set -euo pipefail
+
+cd /Odyssey/private/rfablet/Python/4dvarnet-fm-opencode/4dvarnet-fm-fdv2
+
+export PATH="/Odyssey/private/rfablet/miniforge3/envs/fdv-monai-proto/bin:$PATH"
+export CONDA_DEFAULT_ENV=fdv-monai-proto
+export PYTHONUNBUFFERED=1
+NODE_TMP="/SCRATCH/$USER/slurm_tmp/${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"; mkdir -p "$NODE_TMP" 2>/dev/null || { NODE_TMP="/tmp/${USER}_slurm_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}"; mkdir -p "$NODE_TMP"; }
+export TMPDIR="$NODE_TMP" MPLCONFIGDIR="$NODE_TMP/mplconfig"; trap 'rm -rf "$NODE_TMP"' EXIT
+
+mkdir -p "$MPLCONFIGDIR" sbatch_logs
+
+# Reuse the canonical 200-window S0/S1 test splits instead of regenerating
+# them (slow per-window path). Absolute path to the master worktree cache
+# (shared filesystem; every worktree sees it).
+TEST_CACHE="/Odyssey/private/rfablet/Python/4dvarnet-fm-opencode/experiments/l96_datasets_obsj2_int100_nwin200.pt"
+
+EXPERIMENT="FDV2_subgrad_state_l96"
+echo "============================================"
+echo " L96 FDV2: unrolled 4DVarNet-style solver (update_input=subgrad+state) | $(date)"
+echo "  Experiment: ${EXPERIMENT}"
+echo "  Config: 24D state, 400 epochs, single-stage, deterministic (no ensemble)"
+echo "  Cheap two-residual proxy gradient (obs residual + prior-autoencoder"
+echo "  residual, ported from ronan_devs' GradSolver_withStep) -- no"
+echo "  torch.autograd.grad/create_graph at all, unlike grad+state -- so"
+echo "  none of grad+state's double-backward instability applies here."
+echo "  Exact copy of FDV2_grad_state_l96's training loss/LR/scheduler"
+echo "  (job 52305) for a like-for-like comparison."
+echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv -i 0 2>/dev/null | tail -1)"
+echo "============================================"
+echo
+
+python train.py \
+  --config-name experiment/${EXPERIMENT} \
+  hydra.run.dir=. \
+  hydra.output_subdir=null \
+  ++data.test_cache=${TEST_CACHE}
+
+echo ""
+echo " Done: ${EXPERIMENT} at $(date)"
+echo ""

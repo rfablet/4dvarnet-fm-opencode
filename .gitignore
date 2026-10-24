@@ -32,8 +32,9 @@ data/processed/
 
 # Outputs
 outputs/
-!reports/outputs/
+!reports/*/outputs/
 results/
+!docs/results/
 lightning_logs/
 
 # OS
@@ -50,6 +51,33 @@ Thumbs.db
 # Generated data & checkpoints
 experiments/
 checkpoint_stage*.pt
+checkpoints/
+*.pt
+
+# QG dataset spinup cache (large generated tensors; not committed)
+reports/qg_cache/
+
+# Coverage
+.coverage
+.pytest_cache/
+
+# Generated figures
+all_figures.pdf
 
 # SLURM logs
 sbatch_logs/
+batch/logs/
+# SLURM sbatch (%A/%a) stderr artifacts written to the repo root
+[0-9]*_[0-9]*.err
+[0-9]*.err
+# Strong-4DVar tuning scratch probes (single-window; not in the report)
+reports/qg/outputs/qg_tune_4dvar/
+
+# Nested topic worktrees (see docs/plans/tech/worktrees.md). These are git worktrees living
+# inside the master worktree; they are never tracked, and ignoring them keeps
+# `git status` readable.
+4dvarnet-fm-*/
+
+# Reviewer PAT (never commit)
+.reviewer-token
+reviewer-token

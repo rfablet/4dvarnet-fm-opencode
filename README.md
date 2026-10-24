@@ -1,104 +1,51 @@
-# 4DVarNet-FM — Physics-Informed Neural Ensemble DA via Conditional Flow Matching
+# 4DVarNet-FM
 
-Implementation of the 4DVarNet-FM framework for stochastic Lorenz-63 data assimilation, combining conditional flow matching with a Tweedie-inspired decomposition for ensemble-based state estimation.
+Flow matching for variational data assimilation, benchmarked against classical DA
+on three dynamical systems.
 
-## Reference
+The question: can a learned generative prior (conditional flow matching, Tweedie
+decompositions, unrolled 4DVarNet solvers) match or beat EnKF / ETKF /
+strong- and weak-constraint 4D-Var on the same observation geometry and the same
+error metrics?
 
-This implementation is based on the manuscript:
+## Case studies
 
-> **4DVarNet-FM: Physics-Informed Neural Ensemble Data Assimilation via Conditional Flow Matching**  
-> R. Fablet, W. de Tinguy, M. Cuzol, B. Chapron  
-> *Preprint, 2025*
+| system | role |
+|---|---|
+| **Lorenz-63** | smallest testbed; parameter-estimation and randomized-parameter studies |
+| **Lorenz-96** (two-scale) | the main benchmark — model error, observation-density sweeps, most neural schemes |
+| **QG** (two-layer quasi-geostrophic) | spatially extended reference case; DA baselines on a Phillips channel |
 
-See [`notes_4dvarnet_fm.pdf`](./reports/notes_4dvarnet_fm.pdf) for the full manuscript.
+## Getting started
 
-The baseline DA methods (Weak-4DVar, Strong-4DVar, EnKF) are adapted from the reference Colab notebook [`notebooks/notebook.ipynb`](./notebooks/notebook.ipynb).
+Read **[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)** — it walks one full
+Lorenz-96 loop end to end: generate data, run the DA baselines, train a neural
+scheme, evaluate it against them, render the benchmark table.
 
-## Project Structure
+## Layout
 
 ```
-├── data/               # Lorenz-63 SDE dataset generation
-│   ├── lorenz63.py     # Trajectory generation with train/val/test splits
-│   └── dataloader.py   # Flow-matching batch collation
-├── models/             # Neural DA components
-│   ├── interpolant.py  # Linear interpolant (ατ=1-τ, βτ=τ)
-│   ├── unet.py         # 1D U-Net backbone
-│   ├── residual.py     # IterativeUpdateCell (Rᴺᴳ) & MeanEstimatorCell (Ψ̄θ̄)
-│   └── solver.py       # TweedieSolver with Eq. 14 decomposition
-├── training/           # Two-stage training pipeline
-│   ├── losses.py       # State MSE + gradient loss
-│   ├── stage1.py       # Train Gaussian mean estimator Ψ̄θ̄
-│   ├── stage2.py       # Train non-Gaussian residual Rᴺᴳ (freeze Ψ̄θ̄)
-│   ├── lightning_module.py  # PyTorch Lightning wrapper
-│   └── pipeline.py     # pl.Trainer orchestration
-├── evaluation/         # Baselines and metrics
-│   ├── baselines.py    # Weak-4DVar, Strong-4DVar, EnKF
-│   ├── metrics.py      # RMSE, spread, CRPS
-│   ├── experiment.py   # Experiment orchestration
-│   └── run.py          # Baseline runner with caching
-├── conf/               # Hydra structured config schemas
-│   └── schema.py       # DataConfig, ModelConfig, TrainingConfig
-├── config/             # YAML configuration presets
-│   ├── lorenz63_default.yaml
-│   ├── baselines/      # DWS presets (dws20 … dws500)
-│   └── experiment/     # FM experiment configs (A1, B1, C1, C4, D1)
-├── reports/            # Report generation scripts and outputs (tracked)
-│   ├── generate_report.py
-│   ├── generate_baseline_report.py
-│   ├── generate_synthesis.py
-│   ├── notes_4dvarnet_fm.pdf  # Manuscript PDF
-│   └── outputs/        # Synthesis PDFs (versioned)
-├── batch/              # SLURM batch and shell scripts
-│   ├── *.sbatch        # run_baselines, run_enkf_inflation, …
-│   ├── launch.sh
-│   └── run_with_scheduler.sh
-├── notebooks/          # Jupyter notebooks
-│   └── demo_baselines.ipynb  # CS1 vs CS2 baseline comparison
-│   └── notebook.ipynb    # Reference Colab notebook
-├── eval_baselines.py   # Hydra entry point for baseline evaluation
-├── train.py            # Hydra entry point for FM training
-├── run_experiment.py   # End-to-end entry point
-├── run_experiments.py  # Multi-experiment orchestrator
-└── archive/            # Outdated status/plan files (refactoring complete)
+data/        per-system truth simulation, observation geometry, datasets
+models/      dynamics (per system) + neural architectures
+training/    PyTorch Lightning wrappers and the two-stage training pattern
+evaluation/  DA baselines (EnKF/ETKF/4DVar) and neural inference + metrics
+conf/        Hydra structured-config schemas
+config/      YAML experiment presets
+reports/     per-case-study report generators and their result JSONs
+tests/       pytest suite ('not slow' subset is the merge gate)
+batch/       SLURM scripts
 ```
 
-## Quick Start
+Results and their provenance live in `reports/<system>/outputs/`. The report
+generators render from stored JSON, so a report can always be regenerated
+without re-running the science.
 
-```bash
-pip install torch numpy matplotlib
+## Documentation
 
-# Generate data and run baselines
-python run_experiment.py
-
-# Generate baseline synthesis report
-python reports/generate_baseline_report.py \
-    --json experiments/baselines_dws50_inf1.2.json \
-    --trajs experiments/baselines_trajectories_dws50_inf1.2.npz \
-    --output reports/outputs/synthesis_dws50_inf12.pdf
-
-# Or explore interactively
-jupyter notebook notebooks/demo_baselines.ipynb
-```
-
-## Case Studies
-
-- **CS1** — Noise-free forcings, correct parameters → expected good reconstruction
-- **CS2** — OU-corrupted forcings, biased parameters → expected degradation
-
-The key validation criterion is that CS1 RMSE << CS2 RMSE across all methods.
-
-## Citation
-
-If you use this code, please cite the original manuscript:
-
-```bibtex
-@article{fablet2025dvarnetfm,
-  title={4DVarNet-FM: Physics-Informed Neural Ensemble Data Assimilation via Conditional Flow Matching},
-  author={Fablet, R. and de Tinguy, W. and Cuzol, M. and Chapron, B.},
-  year={2025}
-}
-```
-
-## License
-
-See the original manuscript for licensing details.
+| doc | what it covers |
+|---|---|
+| [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | worked path, conventions, gotchas |
+| [`docs/plans/tech/multi_refactor_plan.md`](docs/plans/tech/multi_refactor_plan.md) | where the code structure is heading |
+| [`AGENTS.md`](AGENTS.md) | session workflow, git/PR rules, changelog policy |
+| [`PLAN.md`](PLAN.md) | the running scientific design plan |
+| [`docs/plans/tech/worktrees.md`](docs/plans/tech/worktrees.md) | the one-worktree-per-topic setup |

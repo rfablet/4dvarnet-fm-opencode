@@ -1,8 +1,6 @@
 """Tests for Hydra-based baseline config and eval_baselines.py."""
 import os
 import sys
-import json
-import subprocess
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -12,7 +10,7 @@ from conf.schema import BaselinesConfig, Weak4DVarConfig, Strong4DVarConfig, EnK
 class TestBaselinesConfigDefaults:
     def test_default_values(self):
         bc = BaselinesConfig()
-        assert bc.da_window_steps == 500
+        assert bc.da_window_steps == 300
         assert bc.N_ensemble == 30
         assert bc.batch_size == 128
 

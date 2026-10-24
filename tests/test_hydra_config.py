@@ -1,6 +1,4 @@
-import pytest
 import hydra
-from omegaconf import OmegaConf, DictConfig
 from conf.schema import DataConfig, ExperimentConfig, ModelConfig, TrainingConfig, BaselinesConfig, CS1Config, CS2Config
 
 
@@ -8,7 +6,7 @@ def test_schema_imports():
     """All schema classes can be imported and instantiated."""
     dc = DataConfig()
     assert dc.dt == 0.01
-    assert dc.T_max == 5.0
+    assert dc.T_max == 3.0
     assert dc.system == "lorenz63"
 
     mc = ModelConfig()
@@ -20,7 +18,7 @@ def test_schema_imports():
     assert tc.stage2.epochs == 400
 
     bc = BaselinesConfig()
-    assert bc.da_window_steps == 500
+    assert bc.da_window_steps == 300
     assert bc.weak4dvar.opt_steps == 150
 
     cs1 = CS1Config()
@@ -40,7 +38,7 @@ def test_config_yaml_loads():
     assert cfg.data.system == "lorenz63"
     assert cfg.model.state_dim == 3
     assert cfg.training.stage1.epochs == 200
-    assert cfg.baselines.da_window_steps == 500
+    assert cfg.baselines.da_window_steps == 300
 
 
 def test_config_all_keys_present():
@@ -61,6 +59,7 @@ def test_data_section_keys():
         "sigma_true", "rho_true", "beta_true", "gamma", "W_L_bar",
         "c1", "c2", "sigma_0", "sigma_L", "tau_eta", "sigma_eta",
         "forcing_state_bias", "forcing_coupling", "param_bias", "case",
+        "state_names", "param_names",
     }
     assert set(cfg.data.keys()) == data_keys, f"Missing: {data_keys - set(cfg.data.keys())}"
 
@@ -116,6 +115,6 @@ def test_experiment_config_roundtrip():
     assert ec.model.state_dim == 3
     assert ec.training.batch_size == 32
     assert ec.paths.checkpoint_dir == "checkpoints"
-    assert ec.baselines.da_window_steps == 500
+    assert ec.baselines.da_window_steps == 300
     assert ec.cs1.param_bias == 0.0
     assert ec.cs2.param_bias == 0.15

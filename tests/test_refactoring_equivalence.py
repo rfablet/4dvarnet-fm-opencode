@@ -1,7 +1,5 @@
 """Refactoring equivalence tests: verify old and new pipelines produce same results."""
-import pytest
 import torch
-import numpy as np
 from conf.schema import DataConfig
 from models.solver import TweedieSolver
 from training.losses import StateMSELoss
@@ -91,7 +89,9 @@ class TestDataEquivalence:
         ds2 = Lorenz63Dataset(cfg2)
         for i in range(len(ds1)):
             for key in ["true_state", "obs", "forcing_true", "forcing_corrupted"]:
-                torch.testing.assert_close(ds1[i][key], ds2[i][key])
+                # `obs` is NaN at unobserved steps by construction, and
+                # assert_close treats NaN != NaN unless equal_nan is set.
+                torch.testing.assert_close(ds1[i][key], ds2[i][key], equal_nan=True)
 
     def test_trajectory_reproducible(self):
         """generate_long_trajectory is deterministic with same seed."""
@@ -129,16 +129,16 @@ class TestCheckpointLoading:
     """Legacy checkpoint loading should work."""
 
     def test_legacy_stage1_checkpoint(self, tmp_path):
-        """Lit4DVarNetFM can load a raw mean_estimator state_dict."""
+        """Lit4DVarNetFM can load a full model state dict for stage 1."""
         model = TweedieSolver(state_dim=3, hidden_channels=[4, 8], K_inner=2)
         ckpt_path = tmp_path / "stage1.pt"
-        torch.save(model.mean_estimator.state_dict(), ckpt_path)
+        torch.save(model.state_dict(), ckpt_path)
 
         new_model = TweedieSolver(state_dim=3, hidden_channels=[4, 8], K_inner=2)
         lit_module = Lit4DVarNetFM(model=new_model, stage=1)
         lit_module.load_legacy_checkpoint(str(ckpt_path))
 
-        for p1, p2 in zip(model.mean_estimator.parameters(), new_model.mean_estimator.parameters()):
+        for p1, p2 in zip(model.parameters(), new_model.parameters()):
             torch.testing.assert_close(p1, p2)
 
     def test_legacy_full_checkpoint(self, tmp_path):

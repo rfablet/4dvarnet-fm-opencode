@@ -1,6 +1,13 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Any
-from omegaconf import MISSING
+from typing import List, Tuple, Any, Dict, Optional
+
+
+@dataclass
+class ParamRandomization:
+    randomized: bool = True
+    noise: float = 0.2
+    biased: bool = False
+    bias: float = 0.0
 
 
 @dataclass
@@ -15,6 +22,9 @@ class DataConfig:
     window_spacing: int = 2000
     spinup_steps: int = 10000
     seed: int = 42
+    num_train_windows: int = 1000
+    num_val_windows: int = 100
+    num_test_windows: int = 200
     sigma_true: float = 10.0
     rho_true: float = 28.0
     beta_true: float = 8 / 3
@@ -36,9 +46,66 @@ class DataConfig:
     test_randparam: bool = True
     test_param_noise: float = 0.2
 
+    # Lorenz96 (two-scale) fields
+    NO: int = 8
+    J: int = 4
+    h: float = 1.0
+    hx: float = 1.0
+    eps: float = 0.1
+    F_true: float = 8.0
+    F_da: float = 8.0
+    coupling_exponent_truth: float = 1.6
+    coupling_exponent_da: float = 1.0
+    fast_weights: List[float] = field(default_factory=lambda: [1.0, 1.0, 0.1, 0.1])
+    obs_j: int = 2
+    randomize: Dict[str, ParamRandomization] = field(default_factory=dict)
+    smoke_cached_data: Optional[str] = None
+    test_cache: Optional[str] = None
+    # L96 s0_s1: cache of the generated train/val windows (generated and saved
+    # on first use, reused after a settings check -- see
+    # data.lorenz96.make_l96_s0_s1_trainval_cached). ~0.85 MB per window.
+    train_cache: Optional[str] = None
+    resample_bias_draws: bool = False
+    bias_max: float = 0.2
+    # Training-time fast-Y observation-density augmentation (see
+    # data/obs_density.py::sample_training_density_mask, wired via
+    # data/dataloader.py::make_collate_fm) -- val/test are never augmented.
+    obs_density_augment: bool = False
+    obs_density_full_prob: float = 0.4
+    obs_density_min_keep: int = 0
+    # Training-time random obs times (data/obs_times.py): same obs count per
+    # window as the regular grid, one stratified random step per block,
+    # redrawn every batch -- val/test keep the regular grid.
+    obs_times_random: bool = False
+    # Fixed-grid control: keep the regular obs times, redraw only the obs
+    # noise every batch (exclusive with obs_times_random).
+    obs_noise_redraw: bool = False
+    # Random observing system per window and batch (data/obs_times.py::
+    # resample_obs_variable): obs count in obs_n_range, stratified times,
+    # obs_fast_range fast-channel count drawn once per window (subset redrawn
+    # per obs time); exclusive with the above.
+    obs_random_layout: bool = False
+    obs_n_range: List[int] = field(default_factory=lambda: [5, 50])
+    obs_fast_range: List[int] = field(default_factory=lambda: [4, 16])
+    # obs_random_layout: always observe step 0 (first stratified block's obs
+    # moved to t=0); applies to train and, if enabled, val.
+    obs_first_step: bool = False
+    # Re-observe val windows ONCE (seed val_obs_seed + window index) with the
+    # random observing system, so val_loss / stage1_best selection is measured
+    # on a fixed random layout instead of the regular grid.
+    val_obs_random_layout: bool = False
+    val_obs_seed: int = 20260923
+
+    # Device
+    device: str = "cpu"
+
     @property
     def num_steps(self) -> int:
         return int(self.T_max / self.dt)
+
+    @property
+    def use_corrupted_forcing(self) -> bool:
+        return self.case == 2
 
     @property
     def biased_params(self) -> Tuple[float, float, float]:
@@ -55,9 +122,43 @@ class DataConfig:
             return (self.sigma_true, self.rho_true, self.beta_true)
         return self.biased_params
 
-    @property
-    def use_corrupted_forcing(self) -> bool:
-        return self.case == 2
+    def to_lorenz96_config(self) -> Any:
+        """Convert to data.lorenz96.Lorenz96Config."""
+        from data.lorenz96 import Lorenz96Config as L96C
+        return L96C(
+            case=self.case, dt=self.dt, T_max=self.T_max,
+            obs_interval=self.obs_interval, R_var=self.R_var,
+            B_var=self.B_var, param_bias=self.param_bias,
+            num_windows=self.num_windows, window_spacing=self.window_spacing,
+            spinup_steps=self.spinup_steps, seed=self.seed,
+            NO=self.NO, J=self.J, h=self.h, hx=self.hx, eps=self.eps,
+            F_true=self.F_true, F_da=self.F_da,
+            gamma=self.gamma, W_L_bar=self.W_L_bar, c1=self.c1, c2=self.c2,
+            sigma_0=self.sigma_0, sigma_L=self.sigma_L,
+            tau_eta=self.tau_eta, sigma_eta=self.sigma_eta,
+            forcing_state_bias=self.forcing_state_bias,
+            forcing_coupling=self.forcing_coupling,
+            coupling_exponent_truth=self.coupling_exponent_truth,
+            coupling_exponent_da=self.coupling_exponent_da,
+            fast_weights=list(self.fast_weights),
+            randomize={k: {"randomized": v.randomized, "noise": v.noise,
+                           "biased": v.biased, "bias": v.bias}
+                       for k, v in self.randomize.items()},
+            obs_var_indices=self._compute_obs_var_indices(),
+        )
+
+    def _compute_obs_var_indices(self):
+        obs_j = self.obs_j
+        if obs_j is None or obs_j >= self.J:
+            return None
+        NO = self.NO
+        J = self.J
+        X_idx = list(range(NO))
+        Y_idx = []
+        for k in range(NO):
+            for j in range(obs_j):
+                Y_idx.append(NO + k * J + j)
+        return tuple(X_idx + Y_idx)
 
     def to_lorenz63_config(self) -> Any:
         """Convert to data.lorenz63.Lorenz63Config."""
@@ -82,6 +183,7 @@ class DataConfig:
 class DirectUNetConfig:
     hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
     dropout: float = 0.1
+    cond_extra_dim: int = 0
 
 
 @dataclass
@@ -91,11 +193,250 @@ class VanillaCFMConfig:
     N_outer: int = 10
     sigma_prior: float = 0.5
     dropout: float = 0.1
+    train_tau_0_only: bool = False
+    cond_extra_dim: int = 0
+
+
+@dataclass
+class JointCFMConfig:
+    param_dim: int = 4
+    param_loss_weight: float = 0.1
+    param_noise_min: float = 0.0
+    param_noise_max: float = 0.3
+    param_flow_channels: Optional[List[int]] = None
+    train_tau_0_only: bool = False
+    param_ref: Optional[List[float]] = None
+    param_flow_pool: str = "mean"
+
+
+@dataclass
+class JointDirectUNetConfig:
+    param_dim: int = 4
+    param_loss_weight: float = 0.1
+    param_head_channels: Optional[List[int]] = None
+    param_ref: Optional[List[float]] = None
+    param_head_pool: str = "mean"
+    param_head_backbone: str = "cnn"
+
+
+@dataclass
+class JointCFMCoupledConfig:
+    param_dim: int = 4
+    param_loss_weight: float = 0.1
+    param_flow_channels: Optional[List[int]] = None
+    param_ref: Optional[List[float]] = None
+    param_flow_pool: str = "mean"
+
+
+@dataclass
+class ParamHeadConfig:
+    param_dim: int = 8
+    param_head_channels: Optional[List[int]] = None
+    param_ref: Optional[List[float]] = None
+    param_head_pool: str = "mean"
+    state_checkpoint: Optional[str] = None
+    state_model_type: str = "direct_unet"
+    state_hidden_channels: Optional[List[int]] = None
+    state_cond_extra_dim: int = 0
+    state_source: str = "l1b"
+    augment_derivatives: bool = False
+
+
+@dataclass
+class ParamHeadUNetConfig:
+    param_dim: int = 8
+    hidden_channels: Optional[List[int]] = None
+    param_ref: Optional[List[float]] = None
+    param_head_pool: str = "mean"
+    state_checkpoint: Optional[str] = None
+    state_model_type: str = "direct_unet"
+    state_hidden_channels: Optional[List[int]] = None
+    state_cond_extra_dim: int = 0
+    state_source: str = "l1b"
+
+
+@dataclass
+class PredictStateCFMConfig:
+    hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
+    time_emb_dim: int = 64
+    N_outer: int = 10
+    sigma_prior: float = 0.5
+    dropout: float = 0.1
+    train_tau_0_only: bool = False
+    cond_extra_dim: int = 0
+    # tau-consistency training options (docs/plans/analysis/l96_cfm_tau_consistency_next_steps.md);
+    # also read from model.monai_predict_state_cfm. Every default is the plain CFM loss.
+    tau0_frac: float = 0.0
+    tau0_zero_input: bool = False
+    tau_sampling: str = "uniform"
+    tau_low_frac: float = 0.5
+    tau_low_max: float = 0.4
+    boot_frac: float = 0.0
+    boot_tau_min: float = 0.0
+    boot_tau_max: float = 0.0
+    boot_dtau_min: float = 0.2
+    boot_dtau_max: float = 0.5
+    boot_alpha: float = 1.0
+    boot_ema_decay: Optional[float] = None
+    boot_start_epoch: int = 0
+    var_weight: float = 0.0
+    var_tau_min: float = 0.05
+    var_tau_max: float = 0.95
+    var_fd_eps: float = 1e-2
+    var_start_epoch: int = 0
+    # Sampler: Euler grid tau_k = 1 - (1 - k/N)^step_power (models.vanilla_cfm.DEFAULT_STEP_POWER).
+    step_power: float = 0.5
+
+
+@dataclass
+class TweedieCFMConfig:
+    hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
+    time_emb_dim: int = 64
+    K_inner: int = 5
+    N_outer: int = 10
+    sigma_prior: float = 0.5
+    dropout: float = 0.1
+    train_tau_0_only: bool = False
+    cond_extra_dim: int = 0
+
+
+@dataclass
+class SDAPriorConfig:
+    hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
+    time_emb_dim: int = 64
+    N_outer: int = 10
+    sigma_prior: float = 0.5
+    dropout: float = 0.1
+
+
+@dataclass
+class FourDVarNetConfig:
+    hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
+    time_emb_dim: int = 64
+    N_outer: int = 10
+    dropout: float = 0.1
+    update_input: str = "obs+state"
+    R_var: float = 0.5
+    prior_weight: float = 1.0
+    clip_range: float = 50.0
+    trainable_prior_weight: bool = True
+    aux_var_cost_weight: float = 0.0
+    prior_tau_conditioning: bool = False
+    unet_backbone: str = "unet1d"
+    monai_norm_num_groups: int = 32
+    # 2 (default, MonaiUNet1D's own default) = "M" tier with
+    # hidden_channels=[64,128,256] (5,889,048 params, today's default for
+    # every FDV1/FDV2 config). 1 with hidden_channels=[32,64,128] = "S" tier
+    # (1,055,544 params). Ignored for unet_backbone="unet1d". See
+    # project_l96_monai_unet_complexity_tiers memory / _build_backbone_unet's
+    # docstring for the full tier ladder.
+    monai_num_res_blocks: int = 2
+    # None (default) = prior_unet shares hidden_channels with the main solver
+    # unet, i.e. today's behavior. Set to a narrower tier (e.g. [32,64,128],
+    # the S+ tier) to give the solver more relative capacity than the prior,
+    # matching CIA-Oceanix/4dvarnet-global-mapping's ronan_devs branch
+    # convention (glo12-sla-4th-unrolling-ossev1.yaml: solver model_channels=64
+    # vs prior model_channels=32).
+    prior_hidden_channels: Optional[List[int]] = None
+    # Truncated-BPTT over the N_outer unroll: split it into tbptt_n_blocks
+    # contiguous blocks of tbptt_block_size iterations each (must multiply to
+    # N_outer), detach the state between blocks, and average the training
+    # loss computed at the end of every block. Default (n_blocks=1,
+    # block_size=None -> derived as N_outer) is a single block, i.e. today's
+    # behavior (one continuous backward graph, loss from the final iteration
+    # only) -- fully backward-compatible with every existing config/checkpoint.
+    tbptt_n_blocks: int = 1
+    tbptt_block_size: Optional[int] = None
+    # None (default) = falls back to clip_range, today's behavior. Bounds
+    # ONLY the grad-only/grad+state autograd gradient (after
+    # _normalize_channels' RMS division, via a smooth tanh soft-clip, not a
+    # hard clamp) -- independent of clip_range, which still only bounds the
+    # raw state branch via a hard clamp every iteration. Set narrower than
+    # clip_range to make the soft-clip nonlinearity actually engage near its
+    # real operating range (the grad term is RMS-normalized to ~1) without
+    # also tightening the unrelated state-branch clamp.
+    grad_clip_range: Optional[float] = None
+    # 0.0 (default) = x_0 starts at all-zeros, today's behavior. >0 means x_0
+    # ~ N(0, init_state_var) instead (a VARIANCE, not a std -- e.g. 0.1 means
+    # std ~ 0.316 in this normalized state space), sampled fresh every
+    # forward() call, independent of update_input.
+    init_state_var: float = 0.0
+    # 1.0 (default, no-op): multiplies gradsplit+state's g_prior channel
+    # AFTER normalization/soft-clipping. Diagnostic knob -- forcing it near 0
+    # (e.g. 1e-4) makes the fed tensor functionally close to obs+state's own
+    # cat([x, obs_clean]), to test whether a training plateau traces back to
+    # g_prior's contribution specifically. No effect on any other
+    # update_input mode.
+    gradsplit_prior_scale: float = 1.0
+    # False (default, backward-compatible): Phi(x) = prior_unet(x, tau), the
+    # bare backbone output. True: Phi(x) = x + prior_unet(x, tau), an
+    # explicit residual/identity anchor around the whole backbone (not just
+    # MONAI's internal zero-init, which only holds at initialization). Added
+    # after a Jacobian decomposition of gradsplit+state's real prior_cost
+    # gradient found the Jacobian term dominating and nearly orthogonal to
+    # the residual term on a plateaued checkpoint -- see _prior_ae's
+    # docstring in models/fourdvarnet.py.
+    prior_residual: bool = False
+    # None (default): prior_unet uses the same dropout as the main solver
+    # unet -- today's behavior. Set to decouple them, e.g. dropout for the
+    # main solver unet only (prior_unet's own forward is repeatedly re-run
+    # inside torch.autograd.grad(..., create_graph=True) for
+    # grad-only/grad+state/gradsplit+state, so dropout there adds fresh mask
+    # noise into that higher-order computation at every unrolled iteration).
+    prior_dropout: Optional[float] = None
+    # 0.0 (default, no-op): overrides prior_unet's (monai backbone only)
+    # final output conv's zero_module init with N(0, prior_output_init_std)
+    # instead of exact zero. Only meaningful alongside prior_residual=true --
+    # exact zero-init is a provable permanent dead end there (both prior_cost
+    # and the per-iteration g_prior signal are proportional to this layer's
+    # output, which is why the layer can never receive a nonzero gradient
+    # once it starts at exactly zero -- see models/monai_unet_adapter.py's
+    # MonaiUNet1D.__init__ docstring for the full derivation).
+    prior_output_init_std: float = 0.0
+    # False (default, backward-compatible; grad-only/grad+state only):
+    # create_graph=not detach_var_cost_grad for the per-iteration combined
+    # torch.autograd.grad(var_cost, x, ...) call. Does NOT change what's fed
+    # to the solver UNet (still the real, Jacobian-including gradient) --
+    # only whether the outer supervised loss can later differentiate
+    # through it into prior_unet's weights/prior_weight (which then train
+    # only via the aux prior_cost loss instead). See
+    # models/fourdvarnet.py::_build_update_input's docstring for the full
+    # derivation.
+    detach_var_cost_grad: bool = False
+    # False (default, backward-compatible; only meaningful alongside
+    # update_input="subgrad+state+trueprior"): tells train.py's
+    # model_factory to compute obs_var_indices/true_dynamics_dt from
+    # cfg.data (NO/J/obs_j/dt) and pass them to FourDVarNetSolver, and tells
+    # the data-loading path to leave `states`/`true_state` at the FULL
+    # physical state dimension (obs_var_indices=None passed to
+    # FlowMatchingDataset there) instead of pre-slicing to the observed
+    # subspace -- the true L96 dynamics needs every fast-Y component to be
+    # well-defined at all (see models/fourdvarnet.py's
+    # _true_ode_prior_residual docstring).
+    full_state_target: bool = False
+
+
+@dataclass
+class FourDVarNetCFMConfig:
+    hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
+    time_emb_dim: int = 64
+    N_outer: int = 10
+    K_inner: int = 5
+    sigma_prior: float = 0.5
+    dropout: float = 0.1
+    train_tau_0_only: bool = False
+    update_input: str = "obs+state"
+    clip_range: float = 50.0
+    R_var: float = 0.5
+    obs_weight: float = 1.0
+    min_obs_weight: float = 1e-3
+    trainable_obs_weight: bool = True
+    grad_clip_range: Optional[float] = None
 
 
 @dataclass
 class ModelConfig:
-    model_type: str = "tweedie"  # "tweedie" | "direct_unet" | "vanilla_cfm"
+    model_type: str = "tweedie"  # "tweedie" | "direct_unet" | "vanilla_cfm" | "joint_cfm" | "predict_state_cfm" | "tweedie_cfm" | "param_head" | "param_head_unet" | "sda_prior" | "sda_prior_cond" | "fourdvarnet" | "fourdvarnet_cfm"
     state_dim: int = 3
     hidden_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
     time_emb_dim: int = 64
@@ -107,6 +448,16 @@ class ModelConfig:
     dropout: float = 0.1
     direct_unet: DirectUNetConfig = field(default_factory=DirectUNetConfig)
     vanilla_cfm: VanillaCFMConfig = field(default_factory=VanillaCFMConfig)
+    joint_cfm: JointCFMConfig = field(default_factory=JointCFMConfig)
+    joint_cfm_coupled: JointCFMCoupledConfig = field(default_factory=JointCFMCoupledConfig)
+    joint_direct_unet: JointDirectUNetConfig = field(default_factory=JointDirectUNetConfig)
+    param_head: ParamHeadConfig = field(default_factory=ParamHeadConfig)
+    param_head_unet: ParamHeadUNetConfig = field(default_factory=ParamHeadUNetConfig)
+    predict_state_cfm: PredictStateCFMConfig = field(default_factory=PredictStateCFMConfig)
+    tweedie_cfm: TweedieCFMConfig = field(default_factory=TweedieCFMConfig)
+    sda_prior: SDAPriorConfig = field(default_factory=SDAPriorConfig)
+    fdv: FourDVarNetConfig = field(default_factory=FourDVarNetConfig)
+    fdv_cfm: FourDVarNetCFMConfig = field(default_factory=FourDVarNetCFMConfig)
 
 
 @dataclass
@@ -114,6 +465,10 @@ class StageConfig:
     epochs: int = 200
     lr: float = 1e-3
     gradient_clip_val: float = 10.0
+    use_cosine_scheduler: bool = True  # deliberate default since 2026-09-10, see CHANGELOG.md
+    obs_weight_lr_scale: float = 1.0
+    prior_unet_lr_scale: float = 1.0
+    init_from: Optional[str] = None  # weights-only initialisation (fine-tuning)
 
 
 @dataclass
@@ -128,6 +483,9 @@ class TrainingConfig:
     stage2: StageConfig = field(default_factory=lambda: StageConfig(epochs=400, lr=1e-3, gradient_clip_val=1.0))
     batch_size: int = 32
     loss: LossConfig = field(default_factory=LossConfig)
+    # Seeds model init, batch order and per-batch obs draws (set after data
+    # generation, which has its own seeds); None keeps runs unseeded.
+    seed: Optional[int] = None
 
 
 @dataclass
@@ -153,11 +511,14 @@ class Strong4DVarConfig:
 @dataclass
 class EnKFConfig:
     inflation: float = 1.0
+    loc_radius: float = -1.0
 
 
 @dataclass
 class ETKFConfig:
     inflation: float = 1.0
+    loc_radius: float = -1.0
+    loc_mode: str = "square_root"
 
 
 @dataclass

@@ -5,7 +5,6 @@ Provides reusable fixtures for configs, datasets, and devices.
 """
 import pytest
 import torch
-import numpy as np
 from data.lorenz63 import Lorenz63Config, Lorenz63Dataset
 
 
@@ -62,6 +61,28 @@ def cs2_config():
         R_var=0.5,
         B_var=2.0,
         spinup_steps=10000,
+    )
+
+
+@pytest.fixture
+def l63_dynamics(cs1_config):
+    """Dynamics for the L63 DA baselines.
+
+    EnKF/ETKF/Strong4DVar/Weak4DVar take an explicit ``dynamics=`` since the
+    2026-07 case-study refactor. It defaults to ``None``, so a baseline built
+    without it raises ``AttributeError: 'NoneType' object has no attribute
+    'step'`` on the first ``assimilate()`` call.
+    """
+    from models.lorenz63_dynamics import Lorenz63Dynamics
+    return Lorenz63Dynamics(
+        dt=cs1_config.dt,
+        coupling_exponent=cs1_config.coupling_exponent_da,
+        c1=cs1_config.c1,
+        c2=cs1_config.c2,
+        gamma=cs1_config.gamma,
+        W_L_bar=cs1_config.W_L_bar,
+        sigma_0=cs1_config.sigma_0,
+        sigma_L=cs1_config.sigma_L,
     )
 
 

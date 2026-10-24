@@ -1,8 +1,9 @@
 #!/bin/bash
+# DEPRECATED: Use batch/run_test_suite.sbatch (sbatch) instead.
 # Quick Test Suite Runner for Lorenz-63 DA Baselines
 # Created: June 25, 2026
 
-cd /homes/rfablet/HomeOdyssey/Python/4dvarnet-fm-opencode
+cd /Odyssey/private/rfablet/Python/4dvarnet-fm-opencode
 
 echo "====================================="
 echo "Lorenz-63 DA Baselines - Test Runner"
@@ -17,8 +18,8 @@ if [ ! -d "tests" ]; then
 fi
 
 # Activate conda environment
-echo "🔧 Activating conda environment 'fdv'..."
-source activate fdv 2>/dev/null || conda activate fdv
+echo "🔧 Activating conda environment 'fdv-monai-proto'..."
+source activate fdv-monai-proto 2>/dev/null || conda activate fdv-monai-proto
 
 # Option 1: Fast tests only (recommended for quick validation)
 echo ""

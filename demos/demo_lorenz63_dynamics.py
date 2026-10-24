@@ -22,7 +22,6 @@ import os
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -39,8 +38,7 @@ def plot_3d_attractor(trajectory, save_path):
     
     # Color by time
     time_steps = np.arange(len(X))
-    colors = plt.cm.viridis(time_steps / len(time_steps))
-    
+
     # Scatter plot with time coloring
     scatter = ax.scatter(X, Y, Z, c=time_steps, cmap='viridis', s=1, alpha=0.6)
     

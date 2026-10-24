@@ -1,0 +1,644 @@
+# Exploiting prior knowledge under sparse observations and model uncertainty — ML-venue scoping
+
+**Status:** SCOPING v1 (2026-09-16), **revised 2026-09-17** to absorb the
+FM-prior conditional-sampler results (PR #211,
+`reports/l96/outputs/l96_fm_sampler_benchmark.md`). That revision closes §10
+decision 4, narrows and re-points risk R6, and adds the orthogonality condition
+that §2.2's additivity actually rests on. Targeting an ML venue (ICLR / NeurIPS /
+TMLR). Supersedes the *framing* of
+`docs/plans/paper/superseded/multi_best_prior_approximate_inference.md`; that doc's testbed ladder and
+risk register are folded in below. `docs/plans/analysis/multi_phaseD_physics_priors.md`
+remains the dynamical-systems work plan.
+
+**Deliberately not DA-only.** Three case-study families — deconvolution, Fourier
+subsampling (MRI-style), chaotic dynamics — plus a Gaussian negative control. The
+claim is about inverse problems in general; DA is one instance.
+
+**Provenance.** The `Ψ_mean / Ψ_G / Ψ_NG` partition adopted here as the
+organizing framework comes from two drafts on `master` (added in #209):
+`docs/note_fm_distribution_score_2025 (14).pdf` ("Decomposing Information Content
+in Posteriors: A Flow-Matching Perspective") and
+`docs/preprint_4dvarnet_fm_2025 (42).pdf` ("Physics-Informed Neural Ensemble Data
+Assimilation via Conditional Flow Matching"). **Their tables and experiments are
+placeholders and must not be reasoned from**; the only performance figures used
+anywhere below come from this repo's own L96/QG results. Three inconsistent
+variants of the gain matrix appear across those drafts — see §2 for the form
+verified empirically.
+
+---
+
+## 1. The question
+
+Inverse problem `y = H(x) + ε`, true prior `x ~ p*`, target posterior `p(x|y)`.
+
+Under **exact** inference: `p*` is the optimal prior, targeting `p(x|y)` exactly
+is optimal, and the prior is independent of `H`. All three are theorems and none
+is interesting.
+
+Under **approximate** inference — finite iterations, finite ensemble, finite
+sampler steps, finite capacity — none of the three need hold:
+
+- **Q1.** Is `p*` the best prior *to use*?
+- **Q2.** Is exactly targeting `p(x|y)` the best *objective*, or does a
+  deliberately-approximate posterior representation do better at fixed budget?
+- **Q3.** Should the prior be independent of the observation configuration `H`?
+- **Q4.** When `p*` is known only up to model uncertainty (hierarchical), or is
+  misspecified, how do the answers move?
+
+Q1/Q2 are the same phenomenon seen from the prior and posterior sides: does
+statistical optimality survive a computational budget. None of this violates
+Bayes; all of it is approximation theory.
+
+**Ordering for reception.** Q1/Q2 are the surprise — a learned representation
+winning *when the exact object is available and correct*. Q4 alone would reduce
+to "learned methods are robust to misspecification," which is well known. Lead
+with Q1.
+
+---
+
+## 2. Organizing framework: the flow-matching operator decomposition
+
+This is what makes the paper a *method*- and *domain*-agnostic contribution
+rather than a benchmark.
+
+With the linear interpolant `x_τ = α_τ x₀ + β_τ x₁`, `x₀ ~ N(0,I)`, the
+flow-matching velocity is determined by the conditional-expectation operator
+
+```
+Ψ(x_τ, y, τ) = E[x₁ | x_τ, y]
+```
+
+which admits an exact additive partition (Tweedie):
+
+```
+Ψ = Ψ_mean(y)  +  Ψ_G(x_τ,y,τ)  +  Ψ_NG(x_τ,y,τ)
+    └ μ_{1|y} ┘   └ K_τ(x_τ − β_τ μ_{1|y}) ┘   └ (α²_τ/β_τ)·R_score ┘
+```
+
+with gain
+
+```
+K_τ = β_τ(β²_τ I + α²_τ Σ⁻¹_{1|y})⁻¹  =  β_τ Σ_{1|y}(β²_τ Σ_{1|y} + α²_τ I)⁻¹
+```
+
+The second form avoids inverting `Σ_{1|y}` and is the one verified empirically
+(§7). Boundary conditions: `K_0 = 0`, `K_1 = I`; at τ=0 the estimator collapses
+to `μ_{1|y}`, at τ=1 to `x₁`.
+
+### 2.1 Every inversion method defines a Ψ̃ — hence a taxonomy
+
+| method class | Ψ̃_mean | Ψ̃_G | Ψ̃_NG | how Ψ̃ is obtained |
+|---|---|---|---|---|
+| deterministic point estimator (4D-Var, OI, DirectUNet, unrolled solvers) | `x̂(y)` — constant in `x_τ,τ` | 0 | 0 | directly |
+| ensemble / Kalman (EnKF, ETKF, smoothers) | ensemble mean | ✓ (the Kalman gain *is* `K_τ`) | **0 by construction** | from members: mean + covariance |
+| unconditional prior + guidance (score-based DA) | y-independent | ✓ | ✓ | the prior net + guidance term |
+| conditional flow / diffusion | ✓ | ✓ | ✓ | the network itself |
+
+Two consequences worth stating up front:
+
+1. **A MAP estimator is not outside the framework** — it is the `Ψ_mean`-only
+   class, with its deficit sitting *inside* `S(Ψ_mean, Ψ̃_mean)` as a MAP-vs-MMSE
+   gap. Integrating the ODE with a constant `Ψ̃` gives
+   `x_τ = τx̂ + (1−τ)x₀ → x̂`: deterministic collapse, zero spread. Correct.
+2. **Variational DA and a feed-forward regressor occupy the same cell**, differing
+   only in whether `Ψ_mean` approximates the mode or the mean. This makes their
+   comparison free of any spread confound.
+
+### 2.2 The deficit decomposition
+
+For a divergence `S` on velocity fields (an `L^p` norm in operator space —
+note this is a **divergence between two distributions**, not a scoring rule in
+the technical sense; the draft note's terminology needs fixing here):
+
+```
+S(Ψ, Ψ̃)  =  S(Ψ_mean, Ψ̃_mean) + S(Ψ_G, Ψ̃_G) + S(Ψ_NG, Ψ̃_NG)
+```
+
+This attributes each method's error to a *named component*, in any domain. It is
+the paper's diagnostic contribution.
+
+**The additivity is conditional, and the condition must be stated.** First it
+forces `p = 2` — no other `L^p` norm decomposes additively at all, so the "`L^p`
+norm" above should read `L²`. Writing `Δ = Ψ − Ψ̃` as the sum of the three
+component differences, `S = ‖Δ‖²` then splits additively only if those
+differences are mutually orthogonal in the `x_τ` inner product. Two of the three cross terms vanish for free: `Ψ_mean` is constant in
+`x_τ` and `E[Ψ_G] = 0`, since `E[x_τ|y] = β_τ μ_{1|y}` makes the gain term
+centered by construction. The third does **not** come for free — `Ψ_NG ⊥ affine`
+holds exactly only if `Ψ_G` is defined as the `L²` *projection* of `Ψ` onto
+affine functions of `x_τ`, whereas §2 defines it by the closed-form Tweedie gain.
+These coincide to **1.5% (V3) / 4% (FDV1CFM)** on the two measured checkpoints
+(§7). *Resolution:* **define `Ψ_G` as the projection**, and report the
+closed-form gain as a *prediction* of it. This costs nothing, makes the
+decomposition of `S` exact rather than approximate, and converts §7's agreement
+from an assumption into a result.
+
+---
+
+## 3. Claims
+
+- **C1 (Q1/Q2).** Under finite budget, a learned representation of a
+  distribution can outperform using that *same* distribution exactly — the gap is
+  purely computational, not statistical.
+- **C2.** Method deficits attribute predictably to named components; in
+  particular Gaussian-update methods carry `S(Ψ_NG, 0)` in full, and deterministic
+  estimators carry `S(Ψ_G,0) + S(Ψ_NG,0)` plus a MAP-vs-MMSE term.
+- **C3 (Q3).** The best prior depends on `H` under approximate inference;
+  **config-distribution-aware** dominates both config-specific and
+  config-agnostic.
+- **C4 (mechanism).** The exact prior's natural representation concentrates its
+  constraint along the operator's most-amplifying directions, misaligned with
+  where observations are informative. **Where that ill-conditioning is fixed and
+  linear it is removable by preconditioning; where it is state-dependent or the
+  prior is non-Gaussian, it is not** — and that is exactly where learned priors
+  win.
+
+C4 is the load-bearing distinction. It is also what protects the paper from the
+obvious rebuttal (see §6, R1).
+
+---
+
+## 4. Case studies
+
+*Rewritten 2026-09-18. The earlier table was organized by "is `p*` known / is
+`H` known". Both axes now read ✓ in every row, so they no longer separate
+anything — see §4.0 for why, and §4.2 for the axes that replaced them.*
+
+### 4.0 The admission criterion, stated so it can be checked
+
+E2 needs two arms, and they need **different** things from `p*`:
+
+| arm | needs |
+|---|---|
+| **(b)** a learned representation of `p*` | **sampling** from `p*` |
+| **(a)** `p*` used *exactly* | **tractable posterior inference** under `p*` — an evaluable density/score, or latent structure making an exact/near-exact sampler available |
+
+**A black-box sampler is therefore not sufficient.** It gives arm (b) and leaves
+arm (a) undefined — which is exactly why L96/QG were withdrawn (§8.1): for a
+chaotic system in 40+ dimensions, "we know `p*`" means "we can simulate from it",
+and there is no tractable exact posterior to compare against.
+
+**A family is admitted as an E2 host only if `p*` is exactly samplable *and*
+admits near-exact posterior inference under that family's `H`.** Everything below
+satisfies this; nothing that fails it is in the paper.
+
+A consequence worth stating in the paper: **the ML paper is deliberately
+synthetic throughout**, because the question *requires* a known prior. External
+validity is supplied by the companion DA papers on L96/QG
+(`docs/plans/paper/multi_p1_structural_hypotheses.md`,
+`docs/plans/paper/l96_p2_unrolled_solvers_and_flows.md`), not by adding a real-data arm
+here. That is a division of labour, not an omission, and it should be written as
+such — a real-data family that conspicuously could not host the headline
+experiment would *advertise* the limitation rather than cover it.
+
+### 4.1 The families
+
+| family | `p*` | how arm (a) is done | `Ψ_NG` | ill-conditioning | role |
+|---|---|---|---|---|---|
+| **A. Gaussian random field**, `σ_k ~ k^{−α}` | Gaussian, exact | closed form | **≡ 0** | smooth decay, fixed & linear | **negative control** — preconditioning suffices; shows where the effect does *not* appear |
+| **B. Deconvolution**, known PSF | **Gaussian scale mixture** field, exact | **Gibbs**: `x \| s,y` linear-Gaussian, `s \| x` independent 1-D draws | ≠ 0 | smooth decay, fixed & linear; **OTF decay is the dial** | **primary E2 host**; the only family where the `Ψ` decomposition itself is checkable against ground truth (§4.3) |
+| **C1. Fourier subsampling** (MRI-style) | phantom generative program (label field + Gaussian intensities), exact | Gibbs, same structure as B | ≠ 0 | **null space**, fixed & linear | E2, **and Q3 against a reference posterior** — the sampling mask *is* the observation configuration |
+| **D′. Lorenz-63, weak-constraint** | trajectory prior `p(x₀)∏p(x_{t+1}\|x_t)` from the **SDE** — evaluable *and* samplable | **particle smoother** (3-D state), near-exact | ≠ 0 | **state-dependent** — rotates with the state | carries **C4's load-bearing half**; Q4 ladder for free |
+
+**Why B is the primary host.** The Gaussian-scale-mixture representation
+`x \| s ~ N(0, Σ(s))` is exactly samplable, genuinely non-Gaussian (the class
+covers Student-t, generalized Gaussian and mixtures), *and* posterior-tractable
+by Gibbs under a linear-Gaussian likelihood. It is also the standard
+wavelet-domain deconvolution prior, so the family is literature-grounded rather
+than invented for the paper. Keep a **TV / sparse-gradient** instance as a
+*secondary, harder* case — its density is known only up to `Z`, so arm (a) needs
+full MCMC.
+
+**Why C1 earns a place next to B.** Not "MRI flavour": in B, `H` is full-rank but
+ill-conditioned and the prior must fight **amplification**; in C1, `H` is
+**rank-deficient** and the prior must **extrapolate into an exact null space**,
+where the data carry *zero* information. That is C4's misalignment taken to its
+limit. *Design constraint:* keep the label process simple enough that Gibbs
+mixes — a Potts/MRF field needs Swendsen–Wang and may not mix at scale; an iid
+or simple-partition label process is the safe choice.
+
+**Why D′ is not optional.** A, B and C1 are **all fixed linear operators**, so
+preconditioning should work in every one of them. C4 claims that where
+ill-conditioning is *state-dependent* it cannot be preconditioned away — and D′
+is the only family that tests it. Without D′ the paper asserts C4's second half
+and never measures it, which also removes R1's defence against the
+preconditioning rebuttal. D′ is additionally the **cheapest** family, not the
+most expensive: `data/lorenz63.py` is already an SDE simulator, so the
+weak-constraint trajectory prior is what the code natively generates, and a 3-D
+particle smoother is cheap. Its budget axis is unusually clean — arm (a) is
+*particles*, arm (b) is *sampler steps*.
+
+### 4.2 What the family set is designed to isolate
+
+| step | holds fixed | varies | tests |
+|---|---|---|---|
+| **A → B** | operator type (smooth decay, linear) | `Ψ_NG` = 0 → ≠ 0 | whether non-Gaussianity alone produces the effect |
+| **B → C1** | `Ψ_NG ≠ 0`, fixed linear operator | decay → **null space** | whether the *kind* of fixed ill-conditioning matters |
+| **C1 → D′** | `Ψ_NG ≠ 0` | fixed → **state-dependent** | **C4** — the preconditioning boundary |
+
+### 4.3 Two properties that only B and C1 have
+
+1. **The decomposition is checkable against ground truth.** Under a latent
+   Gaussian mixture, `Ψ_mean`, `Ψ_G` and `Ψ_NG` can be computed
+   **semi-analytically** by Rao–Blackwellising over the latent scales `s`. This
+   is the only place in the whole programme where §2's partition can be validated
+   rather than fitted — and it serves E1/M1 in the DA papers too, not just here.
+2. **R5 becomes a test rather than an assumption.** "Arm (b) is a representation
+   of the same `p*`" is checkable by a two-sample test against **exact** prior
+   draws.
+
+### 4.4 Prior art on known-posterior benchmarks
+
+Benchmarks with analytically known posteriors exist — e.g. arXiv **2503.03007**
+(inpainting / tomography / phase-retrieval-inspired problems, code released on
+Zenodo and Harvard Dataverse). **Verified by retrieval: they achieve
+tractability by using Gaussian priors with linear operators.** That is our family
+**A**. They are a useful external cross-check for A and **cannot host the
+interesting regime at all**, since `Ψ_NG ≡ 0` there by construction.
+
+That is itself an argument for the paper: *every existing benchmark with a known
+posterior lives where the effect vanishes.* The contribution of §4.1 is a family
+set with known priors where `Ψ_NG ≠ 0`.
+
+### 4.5 The prior-knowledge ladder (Q4), instantiated
+
+| family | exact | hierarchical (known π) | misspecified |
+|---|---|---|---|
+| A Gaussian | Σ known | Σ up to hyperparameters | wrong α / kernel |
+| B deconvolution | exact PSF | PSF family, uncertain width | wrong PSF |
+| C1 Fourier | exact phantom parameters | phantom hyperparameters up to π | wrong label/intensity model |
+| D′ L63 | fixed θ | `θ ~ π` known | biased θ |
+
+*Boundary with P1:* the DA diagnosis paper owns the model-error axis on L96/QG.
+D′'s Q4 row is a different system and a different question (degrading the prior
+in an exact-vs-learned comparison, not DA's structural response to model error).
+State the distinction rather than let the two drift together.
+
+---|---|---|---|
+| A Gaussian | Σ known | Σ up to hyperparameters | wrong α / kernel |
+| B deconvolution | exact PSF | PSF family, uncertain width | wrong PSF |
+| C Fourier/MRI | — | estimated coil sensitivities | wrong sensitivities / off-resonance |
+| D dynamics | fixed θ | `θ ~ π` known (**= S0**) | biased θ (**= S1**) |
+
+---
+
+## 5. Experiments
+
+**E0 — Reference operators.** Obtain the true `Ψ`. Per §4.0 every family now has
+a defined arm (a), so this is a build task rather than a question: **closed form**
+(A); **Gibbs over the latent scales/labels** (B, C1), which additionally gives the
+semi-analytic `Ψ_mean/Ψ_G/Ψ_NG` of §4.3; **particle smoother** on the 3-D
+weak-constraint state (D′). Without a reference, `S(·)` terms are not measurable.
+*Prerequisite.*
+
+**E1 — Deficit decomposition of existing methods.** For each method, construct
+`Ψ̃` per §2.1 and report `S(Ψ_mean)`, `S(Ψ_G)`, `S(Ψ_NG)`. Domain-agnostic; this
+is the diagnostic contribution and it reuses the probe already written
+(`reports/l96/probe_cfm_affine_decomposition.py`) as the measurement instrument.
+**Report on two axes, never on RMSE alone** — see R6: a point-estimate score
+cannot price `Ψ_G + Ψ_NG`, because every scheme that is accurate is accurate by
+suppressing them. Each `S` term is accompanied by the ensemble spread/RMSE ratio
+against `sqrt((N−1)/(N+1))` at matched `N`.
+
+**E2 — Budget sweep (C1, the headline).** Arms: (a) `p*` used exactly *and
+properly preconditioned*; (b) a learned representation of the same distribution,
+verified distributionally equivalent; (c) no prior. Sweep budget `B`.
+**Self-validating:** as `B → ∞` arm (a) must win; if it does not, that is a bug.
+The deliverable is the **crossover budget `B*`**.
+
+**E3 — Conditioning sweep (C4).** Vary `α` (A), OTF decay (B), mask density /
+null-space dimension (C1), Lyapunov spectrum / `n₀` (D′). Prediction: `B*` grows
+with ill-conditioning; **preconditioning removes the effect in A, removes only
+the linear part in B and C1, and provably fails in D′** — that contrast, not the
+individual curves, is what tests C4 (§4.2).
+
+**E4 — Observation-configuration dependence (C3).** For each `H`, find the best
+prior in a parameterized family; does the argmin move? Is one
+config-distribution-aware prior near-optimal across all?
+
+**E5 — Prior-knowledge ladder (Q4).** Run E2 at each rung of §4.1.
+
+---
+
+## 6. Risks
+
+**R1 — the preconditioning rebuttal.** In the linear-Gaussian case a generative
+representation of the prior *is* preconditioning the variational problem
+(cf. centered vs. non-centered parameterizations; and in DA the `B^{1/2}`
+control-variable transform is standard operational practice). If the exact-prior
+arm is implemented in precision form it is a strawman.
+*Mitigation:* implement arm (a) with proper preconditioning; make family A the
+explicit negative control; rest C1 on B, C and D where no such transform exists.
+**This risk is the reason C4 is phrased as it is.**
+
+**R2 — baseline fairness is existential here.** The claim is "learned beats
+exact," so an under-optimized exact arm voids it. Converged solvers with reported
+convergence diagnostics are a prerequisite, not a nicety. (Current repo state:
+`evaluate_all_l96.py` runs Strong-4DVar at `max_iter=10`, Weak-4DVar at
+`opt_steps=50, lr=0.1`.) Note E2's asymptote makes the converged arm *part of the
+result*.
+
+**R3 — `B*` may land where nobody operates**, deflating C1 to "tight budgets
+favour learned priors." *Defense, which must be quantitative:* in
+high-dimensional inference the budget is permanently tight. Requires measured
+`B*` across families, not assertion.
+
+**R4 — Ψ̃ estimation for classical methods** must be specified and validated
+(ensemble → mean + covariance; deterministic → constant operator). Errors here
+would masquerade as deficits.
+
+**R5 — arm (b) must be verified as a representation of `p*`** by a two-sample /
+distributional test, or "same distribution, different representation" is an
+assumption rather than a control.
+
+**R6 — the split may not favour the interesting term.** *Partly measured
+(2026-09-17, PR #211). The measurability blocker is cleared; what remains a risk
+is narrower, and has moved.*
+
+**On RMSE the risk is confirmed, and the original arithmetic understated it.**
+The first read (Strong-4DVar 0.8116 → best deterministic neural 0.3729 → best
+hybrid 0.3411) was reported as "~54% in `Ψ_mean`, ~8.5% in `Ψ_G + Ψ_NG`", but
+those are two differently-normalized relative reductions — 54% *of 0.8116*, 8.5%
+*of 0.3729* — not shares of one gap. As shares of the single 0.8116 → 0.3411 gap
+the split is **~93% / ~7%**.
+
+**But that measurement cannot see the terms it is about.** Every scheme in that
+chain that is accurate is accurate *because it imports a deterministic mean*, and
+the `Ψ_λ` identity (§7) shows that importing a mean shrinks the gain and the
+non-Gaussian term along with it. The 7% is therefore not "what `Ψ_G + Ψ_NG` are
+worth"; it is what a mean-dominated hybrid adds on top of a mean. The one
+configuration that runs those terms at full strength — the cold sampler — is
+*worse* on RMSE (0.5295) and by far the best on dispersion. **A point-estimate
+score cannot price the non-Gaussian branch**, which is now a constraint on E1
+rather than a risk about it.
+
+**The risk that survives has moved to the dispersion axis, and it is confounded.**
+The cold sampler is not calibrated either — ~20–25% over-dispersive, stably
+across `N` (§7) — so "full `Ψ` is the calibrated object" is not yet available as a
+claim. And that miss was measured at a **single guidance strength `Γ = 1e-2` and
+a single `N_outer = 50`**: stability across `N` rules out an ensemble-size
+artifact but says nothing about a guidance-tuning artifact. Whether the
+over-dispersion is a property of the FM prior or of the guidance is **unmeasured**.
+*Mitigation, promoted to P0:* a `Γ` × `N_outer` sweep before any calibration
+result is attributed to the prior. Until it exists, C2's calibration half rests
+on one operating point.
+
+*Residual bookkeeping:* the mixed-convention complaint is resolved for the
+sampler family (uniform proper `N = 30`), but `l96_consolidated_benchmark.md`
+still mixes `N = 1` proxies (marked `*`) with proper `N = 30` scores under one
+bold-best marker. Do not quote ES from that table cross-row.
+
+---
+
+## 7. What is already in hand
+
+- **The decomposition is empirically validated on two trained L96 checkpoints**
+  (`docs/results/l96_cfm_affine_velocity_decomposition.md`, on `master` since #211): the
+  closed-form gain matches the least-squares optimum to ~1.5% (V3) / ~4%
+  (FDV1CFM) from a single parameter;
+  the structural constraint `(1 − β_τK_τ)` holds to <0.015; the predicted peak
+  `τ* = √(s/(s+p))` matches the observed argmax on both checkpoints.
+- **`Ψ_NG` magnitude measured: 19–31% of velocity amplitude**, roughly flat over
+  `τ ∈ [0.1, 0.8]`, rising sharply past 0.9. This is the empirical justification
+  for a non-Gaussian branch existing at all.
+- **Q3 partially answered on L96** (`l96_obs_density_augmented_training.md`):
+  config-distribution-aware (0.473 / 1.081 at keep_k 16 / 0) dominates both
+  config-specific (0.486 / 1.292) and agnostic (0.537 / 1.082).
+- **The L63 machinery gives D′ at no extra cost**: `data/lorenz63.py` is already
+  an SDE simulator, so the weak-constraint trajectory prior is what the code
+  natively generates, and `RandomParamDataset` (σ, ρ, β) supplies §4.5's Q4 row.
+  (The L96/QG S0/S1 machinery is **P1's**, not this paper's — see §4.5's boundary
+  note.)
+
+Added by PR #211 (`reports/l96/outputs/l96_fm_sampler_benchmark.md`), all on L96
+with a uniform proper `N`-member convention:
+
+- **The calibration axis is now measurable** — spread/RMSE against the reliability
+  target `sqrt((N−1)/(N+1))`, at `N = 6 / 10 / 30`. This is the axis R6 said was
+  unreadable.
+- **An FM prior with guidance is a working conditional sampler, and it is not
+  calibrated.** Ratio/target = **1.20 / 1.22 / 1.24** at `N = 6 / 10 / 30` —
+  over-dispersive by a fifth to a quarter, *stable across `N`*, hence a property
+  of the sampler rather than of ensemble size. Its RMSE (0.5295) nonetheless beats
+  Strong-4DVar (0.8116) by **35%** and both ensemble DA baselines by more — same
+  `rmse_repo` convention, same 200 windows. (The source report's prose says 31%;
+  that figure is hardcoded in its generator and reconciles with no pairing in its
+  own tables — 34.8% on `rmse_repo`, 29.9% on `rmse_pooled`. Use the computed one.)
+- **No measured scheme is simultaneously accurate and calibrated.** Every scheme
+  that closes the RMSE gap does so by importing the deterministic mean, and pays
+  in spread: ratios 0.28 (warm start) to 0.59 (best blend) against a target of
+  0.967. The two axes order the methods differently — which is precisely why the
+  deficit must be reported component-wise per axis and not collapsed to a scalar.
+- **The `Ψ_λ` identity, and why the components are not independent knobs.**
+  Blending a deterministic mean `m̂` into the flow with weight `λ` gives
+
+  ```
+  Ψ_λ = [(1−λ)μ_p + λ m̂] + (1−λ)K_p(x_τ − β_τ μ_p) + (1−λ)Ψ_NG
+  ```
+
+  so buying accuracy in the mean slot **provably attenuates both other terms** —
+  the mechanism behind the bullet above. The attempt to decouple the three knobs
+  is a **measured negative result** (worse on *both* axes): `Ψ_NG` is the residual
+  *relative to the specific pair* `(μ_p, K_p)`, and re-using it beneath a
+  different gain is inconsistent, with the inconsistency dominating. This is the
+  evidence behind §10 decision 4, and it is also an argument for learning `Ψ_NG`
+  against a *prescribed* `(μ, K)` — i.e. for the unrolled-mean architecture of
+  `docs/results/l96_cfm_affine_velocity_decomposition.md` §5.
+
+---
+
+## 8. Scope control
+
+### 8.0 Scope revision — superseded by §8.1
+
+*The revision below (2026-09-17) drew the wrong conclusion from a correct
+premise. Read §8.1 first; it is the operative one. §8.0 is kept because its
+diagnosis of family D is still right and is the reason §8.1 acts.*
+
+**The problem: family D cannot host E2, and D is where all the assets are.**
+E2's arm (a) is "`p*` used exactly *and properly preconditioned*". §4's table
+records `p*` as "known ✓ exactly (S0)" for family D, and that cell is doing more
+work than it admits: for a chaotic system, knowing `p*` means you can *simulate*
+from it, not that you can evaluate it or do exact inference with it. At L96's
+dimensionality there is no tractable exact-prior arm. Only **L63** (3-D, where
+§5's grid/SMC reference is honest) and families **A/B/C** admit one. So the
+headline claim is **greenfield** — new code, new baselines — and the repo's real
+asset (200 cached windows, ~30 benchmarked L96/QG methods) does not transfer to
+it.
+
+**The redirection, which two independent arguments agree on.** §6 R6 now measures
+the split at **~93% `Ψ_mean` / ~7% the rest**, with RMSE structurally unable to
+price `Ψ_G + Ψ_NG`. R6's own instruction in that case is to move the emphasis to
+"the quality and conditioning of the conditional-mean operator". That is the
+**matched-budget mean-slot comparison** — hold sampler, objective, parameter
+count and NFE fixed and vary *only* what computes the posterior mean (generic
+UNet vs obs-conditioned unrolled vs gradient-conditioned variational), measured
+under forward-model error and observation sparsification. An independent
+review on 2026-09-15, arguing from novelty and the literature rather than from
+measurement, had already named that same experiment as the one viable ML
+pathway. Two routes converging on one experiment is the strongest signal
+available here.
+
+**It is also testable today** *(but see §8.1 — it is testable in the DA papers,
+not here)*. `FDV1CFM`, `FDV1+FDV1CFM` and `CFM-M(monai,cos)`
+are already benchmark rows; what is missing is only the *controlled* version at
+matched compute.
+
+**Revised target.**
+
+| | was | is |
+|---|---|---|
+| ML paper headline | C1 via E2 (exact vs learned prior) | **matched-budget mean-slot comparison** |
+| role of the `Ψ` partition | "the diagnostic contribution" | the **instrument** that attributes the mean-slot result |
+| C1 / E2 | v1 | *(superseded by §8.1 — C1/E2 stays the v1 headline)* |
+| families C, D as E2 hosts | planned | *(superseded by §8.1 — operative answer is A + B + C1 + D′)* |
+
+**Why C2 is demoted rather than dropped.** The decoupled-control negative result
+(§7) shows the components are not separately manipulable — the partition is a
+**read-out, not a design space**. A diagnostic whose terms cannot be acted on
+independently is a thinner contribution than "the paper's diagnostic
+contribution" implies, but it remains the right language for *explaining* a
+mean-slot result, which is what §7 used it for.
+
+**One dependency, and it is load-bearing.** The ~93%/7% split is anchored on
+Strong-4DVar = 0.8116. **L96 has no Weak-4DVar row** — it is implemented
+(`evaluation/baselines.py`, wired in `evaluation/run_l96.py`) but `--skip-weak`
+is set in essentially every L96 sbatch, while L63 and QG both have it and it is
+best-or-near-best under model error. If Weak-4DVar lands below 0.8116 the anchor
+moves and the split changes. **Run it before quoting 93%/7% anywhere.**
+
+---
+
+### 8.1 Correction, 2026-09-18 — keep the headline; drop L96/QG, not dynamics
+
+§8.0 reasoned: *family D cannot host E2, therefore move the headline off E2.*
+The premise is right and the inference is wrong, because **this paper is
+deliberately not about DA** (§1: three case-study families plus a Gaussian
+control; "the claim is about inverse problems in general; DA is one instance").
+From the same premise the correct conclusion is:
+
+> Family D cannot host E2 → **drop family D**. Keep **C1/E2** as the headline.
+
+Families **A** and **B** host an exact-prior arm *exactly*, and **C** gives an
+exactly-known `H` with mature baselines. Those were always where C1 was testable.
+§8.0 let "the repo's assets do not transfer" drive the conclusion, but that is a
+**cost, not a blocker**: a non-DA paper is greenfield by construction. D was the
+problem, not the headline.
+
+**The matched-budget mean-slot comparison moves out**, to
+`docs/plans/paper/l96_p2_unrolled_solvers_and_flows.md` (M2). It is inherently L96/QG —
+i.e. DA — so it never belonged in a deliberately non-DA paper. That also
+dissolves the overlap §10.6 was opened to manage.
+
+**Operative scope (narrowed 2026-09-18):** families **A + B + C1 + D′**, C1/E2
+as the headline. **The withdrawal above was too broad.** It applies to
+**L96/QG**, not to dynamical systems as such: at 40+ dimensions there is no
+tractable exact posterior, but **L63 in its weak-constraint (SDE) form has an
+evaluable and samplable trajectory prior and a near-exact particle-smoother
+reference in 3-D**, so it meets §4.0's criterion. §5's E0 already said as much
+("near-exact Bayes via SMC/grid on L63"); flattening that to "family D
+withdrawn" removed C4's state-dependent arm, which is the half the mechanism
+claim rests on. See §4.1 row **D′**.
+
+---
+
+**Minimum viable: B + D′**, with A as a half-page negative control. One analytic
+non-Gaussian instance where the mechanism is isolable (B), and the one family
+where the ill-conditioning is state-dependent (D′) — without which C4 is asserted
+rather than tested. **C1 is the highest-value addition**: the only null-space
+instance, and the only place Q3 can be asked against a reference posterior.
+
+**Phasing.** P0: E0 references + converged/preconditioned baselines (R1, R2),
+**plus the `Γ` × `N_outer` guidance sweep (R6)** — until that exists the one
+calibration result in hand rests on a single operating point, and it is cheap
+relative to everything else in P0.
+P1: **D′ end-to-end** — the *cheapest* family (the SDE simulator and a 3-D
+particle smoother already exist), and it carries C4. P2: family B (E1–E3) — the
+cheapest full test of C1 among the *new-code* families, and the one that makes
+the `Ψ` partition checkable (§4.3); **if no crossover appears in B or D′,
+reconsider before building C1**. P3: family C1. P4: E4 genericity.
+
+*Note the reordering:* the previous phasing put family D at P2 "using existing
+S0/S1 assets", which was written when D meant L96/QG. As **L63 weak-constraint**
+it needs no new forward model at all, so it moves to P1.
+
+---
+
+## 9. Positioning
+
+*Cited from memory; verify before any bibliography.* **Gribonval**, "Should
+penalized least squares regression be interpreted as MAP estimation?" (IEEE TSP
+~2011) — penalized-LS estimators correspond to MAP under a *different* prior than
+the generating one; our claim is the computational counterpart.
+**Grünwald** (Safe Bayes / generalized Bayes); **PAC-Bayes** (prior as
+regularizer, not required to be true); **Papaspiliopoulos, Roberts & Sköld**
+(centered vs. non-centered — statistically identical, computationally divergent).
+For family D′: **Trevisan & Uboldi** (JAS 2004), **Bocquet & Carrassi**
+(Tellus A 2017) on assimilation in the unstable subspace — the account of *why*
+the ill-conditioning is state-dependent, which is what D′ exists to test. Flow matching:
+**Lipman et al.**; **Albergo, Boffi & Vanden-Eijnden** (stochastic interpolants).
+
+**The gap:** none of these asks the question with a *known ground-truth prior*, a
+*controllable observation process*, and a *component-wise attribution of method
+deficits*. The combination is what the paper offers.
+
+**Venue.** The diagnostic-tool framing plus three domains makes ICLR/NeurIPS
+defensible; TMLR is the safe target and its criteria (claims supported, some
+audience cares) are clearly met.
+
+---
+
+## 10. Open decisions
+
+1. ~~Is family C (Fourier/MRI) in v1?~~ **CLOSED (2026-09-18).** Reshaped, not
+   deferred: the real-data arm is dropped (it cannot host E2, and a real-data
+   family that visibly omits the headline advertises the limitation), and **C1** —
+   synthetic phantoms with an exact prior — is in, as the only null-space instance
+   and the only place Q3 is askable against a reference. See §4.1.
+2. Is Q3 co-headline with Q1/Q2, or a secondary section?
+3. ~~For family D, adopt **DAPPER** conventions or the repo's Obs30/dws500
+   setup?~~ **MOOT (2026-09-18).** That question was about L96/QG, which are no
+   longer in this paper. **D′ is L63 weak-constraint**, where the reference is a
+   particle smoother rather than a benchmark convention. The DAPPER-vs-bespoke
+   question now belongs to P1, if anywhere.
+4. ~~Does the `S(·)` divergence get defined on velocity fields (as drafted) or on
+   the induced posteriors?~~ **DECIDED (2026-09-17): velocity fields for the
+   *attribution*; posterior-level scores as the *outcome* metric. It is not an
+   either/or, and framing it as one was the error in the original question.**
+
+   Reasons, in increasing order of force:
+
+   - **Only the velocity level carries τ.** `Ψ_G` *is* the gain `K_τ`, boundary
+     conditions `K_0 = 0`, `K_1 = I`; methods differ in *where in* `τ` they
+     deviate, and §2.1's taxonomy is a statement about operators, not about
+     posteriors. A posterior-level split does have a reference pair (posterior
+     mean, posterior covariance) — the objection is not that it lacks one — but
+     it integrates the `τ` structure away, and that structure is the diagnosis.
+   - **Additivity is a property of the velocity-space inner product**, and even
+     there it is conditional (§2.2). No exact additive decomposition of a
+     posterior-level divergence into mean / Gaussian / non-Gaussian parts is
+     available: the cross terms do not vanish.
+   - **Empirically, the partition is a read-out, not a design space.** The
+     decoupling negative result (§7) shows `Ψ_NG` is not invariant under a change
+     of gain, so the components cannot be swapped or re-weighted independently
+     without retraining `Ψ_NG` against the new affine part. **Constraint on
+     E1–E5:** no experiment may treat the three terms as independent knobs; any
+     that appears to must be reformulated as a retraining comparison.
+
+   **The concession the original question was right about.** Readers do expect
+   posterior-level statements, and they must get them — as CRPS/ES *and* the
+   spread/RMSE ratio against `sqrt((N−1)/(N+1))`, reported beside the
+   attribution. What is rejected is *redefining* `S(·)` at the posterior level,
+   not reporting posterior-level outcomes.
+
+5. ~~Is the exact-vs-learned-prior claim (C1/E2) the v1 headline?~~
+   **DECIDED (2026-09-18, revising the 2026-09-17 answer): yes, C1/E2 stays the
+   headline — see §8.1.** The 2026-09-17 decision retargeted the headline onto
+   the mean-slot comparison; that was the wrong fix for a correct diagnosis. What
+   gets dropped is **L96/QG as E2 hosts** — narrowed further in §8.1 — not the
+   headline and not dynamical systems as such.
+
+6. ~~Does the mean-slot comparison belong to this paper or to the DA-venue
+   paper?~~ **CLOSED (2026-09-18): neither of the options as posed — it goes to
+   P2**, `docs/plans/paper/l96_p2_unrolled_solvers_and_flows.md` §5.1 M2. It is an L96/QG
+   experiment and this paper is deliberately non-DA, so the overlap this decision
+   was opened to manage no longer exists.

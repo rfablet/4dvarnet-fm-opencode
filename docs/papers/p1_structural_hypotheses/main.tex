@@ -1,0 +1,79 @@
+% ============================================================================
+%  P1 -- "Restriction or misspecification? Dissecting the errors of classical
+%         and neural data assimilation"
+%  First draft on structure v4 (2026-10-05). Target venue: QJRMS or JAMES.
+%
+%  SOURCE OF TRUTH: docs/plans/paper/l96_p1_structure_v4.md (SCOPING).
+%  The previous draft (structural hypotheses H1--H3b, partition Psi_mean +
+%  Psi_G + Psi_NG) is kept as main.old.tex with its sections/ files.
+%
+%  Every number is traceable to reports/l96/outputs/p1_l96_benchmark.md,
+%  reports/l96/outputs/l96_benchmark_extended.md, docs/results/l96_p1_fm_score.md
+%  or docs/results/l96_weak4dvar.md. Numbers are per-window RMSE on the 24
+%  observed channels, mean over 200 test windows, benchmark framework (1200
+%  epochs, 3 seeds; DA at the #295 inflation, 30 members) unless stated.
+%
+%  Compiles standalone with `article`. For the AGU class, replace the
+%  \documentclass line with \documentclass{agujournal2019}.
+% ============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\usepackage{multirow}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{subcaption}
+
+\hypersetup{colorlinks=true,linkcolor=NavyBlue,citecolor=ForestGreen,urlcolor=NavyBlue}
+
+% --- drafting macros ---------------------------------------------------------
+\newcommand{\todo}[1]{\textcolor{BrickRed}{\textbf{[TODO: #1]}}}
+\newcommand{\needsrun}[1]{\textcolor{BrickRed}{\textbf{[NEEDS RUN: #1]}}}
+\newcommand{\caveat}[1]{\textcolor{Sepia}{\textbf{[CAVEAT: #1]}}}
+\newcommand{\figplaceholder}[2]{\begin{center}\fbox{\parbox{0.9\linewidth}{\centering\vspace{2em}\textbf{Figure placeholder: #1}\\[0.5em]\small #2\vspace{2em}}}\end{center}}
+
+% --- notation ----------------------------------------------------------------
+\newcommand{\xv}{\mathbf{x}}
+\newcommand{\yv}{\mathbf{y}}
+\newcommand{\zv}{\mathbf{z}}
+\newcommand{\thv}{\boldsymbol{\theta}}
+\newcommand{\epsv}{\boldsymbol{\epsilon}}
+\newcommand{\Hop}{\mathcal{H}}
+\newcommand{\Mop}{\mathcal{M}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\FMS}{\mathrm{FMS}}
+\newcommand{\snr}{\mathrm{snr}}
+\newcommand{\Sz}{\textsf{S0}}
+\newcommand{\So}{\textsf{S1}}
+
+\title{Restriction or misspecification?\\
+       Dissecting the errors of classical and neural data assimilation}
+\author{Ronan Fablet \\[0.3em] \normalsize \todo{affiliation; co-author list}}
+\date{First draft (structure v4) --- \today}
+
+\begin{document}
+\maketitle
+
+\input{sections_v4/00_abstract}
+\input{sections_v4/01_introduction}
+\input{sections_v4/02_chain}
+\input{sections_v4/03_fms}
+\input{sections_v4/04_design}
+\input{sections_v4/05_results}
+\input{sections_v4/06_discussion}
+\input{sections_v4/07_appendix}
+
+\bibliographystyle{plain}
+\bibliography{zotero}
+
+\end{document}

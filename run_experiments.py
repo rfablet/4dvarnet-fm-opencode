@@ -6,21 +6,26 @@ Usage:
     python run_experiments.py --experiment A1          # Run specific
     python run_experiments.py --baselines-only         # Cache baselines only
 """
-import os, sys, json, time, argparse, traceback, subprocess, warnings
+import os
+import sys
+import json
+import time
+import argparse
+import traceback
+import subprocess
 import torch
 import numpy as np
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
-from data.lorenz63 import Lorenz63Config, make_mixed_datasets
-from data.dataloader import FlowMatchingDataset, ConcatFMDataset, collate_fm
-from torch.utils.data import DataLoader
-from models.solver import TweedieSolver
-from training.stage1 import train_stage1
-from training.stage2 import train_stage2
-from evaluation.metrics import rmse
-from evaluation.run import (
-    evaluate_baseline, fmt_rmse, run_and_cache_baselines,
-    _BASELINE_METHODS, _BASELINE_CASES, _baseline_traj_path,
+from data.lorenz63 import Lorenz63Config, make_mixed_datasets  # noqa: E402
+from data.dataloader import ConcatFMDataset, collate_fm  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+from models.solver import TweedieSolver  # noqa: E402
+from training.stage1 import train_stage1  # noqa: E402
+from training.stage2 import train_stage2  # noqa: E402
+from evaluation.metrics import rmse  # noqa: E402
+from evaluation.run import (  # noqa: E402
+    fmt_rmse, run_and_cache_baselines,
     EXP_DIR,
 )
 
@@ -80,7 +85,8 @@ EXPERIMENTS = [
 # ── Dataloader factory ──────────────────────────────────────────
 
 def make_experiment_dataloaders(datasets, batch_size=32, train_mix="cs1+cs2",
-                                num_workers=4):
+                                num_workers=4,
+                                obs_interval=20, R_var=0.5):
     kw = dict(batch_size=batch_size, collate_fn=collate_fm,
               num_workers=num_workers, pin_memory=True)
     source_map = {
@@ -89,13 +95,14 @@ def make_experiment_dataloaders(datasets, batch_size=32, train_mix="cs1+cs2",
         "cs2_only": [datasets["train_cs2"]],
     }
     train_sources = source_map.get(train_mix, source_map["cs1+cs2"])
+    obs_cfg = {"obs_interval": obs_interval, "R_var": R_var}
     return {
         "train": DataLoader(
-            ConcatFMDataset(train_sources),
+            ConcatFMDataset(train_sources, **obs_cfg),
             shuffle=True, **kw,
         ),
         "val": DataLoader(
-            ConcatFMDataset([datasets["val_cs1"], datasets["val_cs2"]]),
+            ConcatFMDataset([datasets["val_cs1"], datasets["val_cs2"]], **obs_cfg),
             shuffle=False, **kw,
         ),
     }
@@ -170,7 +177,7 @@ def run_single_experiment(exp, datasets, device, batch_size=256, num_workers=4):
                              epochs=cfg["epochs_stage1"], lr=cfg["lr"], device=device)
         if os.path.exists("checkpoint_stage1.pt"):
             model.mean_estimator.load_state_dict(
-                torch.load("checkpoint_stage1.pt", map_location=device))
+                torch.load("checkpoint_stage1.pt", map_location=device, weights_only=False))
     finally:
         os.chdir(orig_cwd)
     stage1_t = time.time() - t0
@@ -187,16 +194,16 @@ def run_single_experiment(exp, datasets, device, batch_size=256, num_workers=4):
                                  epochs=cfg["epochs_stage2"], lr=cfg["lr"], device=device)
             if os.path.exists("checkpoint_stage2.pt"):
                 model.load_state_dict(
-                    torch.load("checkpoint_stage2.pt", map_location=device))
+                    torch.load("checkpoint_stage2.pt", map_location=device, weights_only=False))
         finally:
             os.chdir(orig_cwd)
         stage2_t = time.time() - t0
         print(f"    Done in {stage2_t:.1f}s")
     else:
-        print(f"  [4/5] Skipped")
+        print("  [4/5] Skipped")
 
     # Evaluate
-    print(f"  [5/5] Evaluating on test sets...")
+    print("  [5/5] Evaluating on test sets...")
     t0 = time.time()
     use_mean = cfg.get("skip_stage2", False)
     m1, s1 = evaluate_model(model, datasets["test_cs1"], device, use_mean_estimator=use_mean)
@@ -220,7 +227,7 @@ def run_single_experiment(exp, datasets, device, batch_size=256, num_workers=4):
     with open(results_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\n  ── Results ─────────────────────────────────")
+    print("\n  ── Results ─────────────────────────────────")
     print(f"  CS1: X={m1[0]:.4f} Y={m1[1]:.4f} Z={m1[2]:.4f}  mean={np.mean(m1):.4f}")
     print(f"  CS2: X={m2[0]:.4f} Y={m2[1]:.4f} Z={m2[2]:.4f}  mean={np.mean(m2):.4f}")
     print(f"  Degradation: {deg:.2f}x  |  Total: {total_t:.0f}s")
@@ -310,7 +317,7 @@ def main():
     data_gen_time = 0
     if os.path.exists(os.path.join(EXP_DIR, "datasets.pt")):
         print("Loading cached datasets...")
-        datasets = torch.load(os.path.join(EXP_DIR, "datasets.pt"))
+        datasets = torch.load(os.path.join(EXP_DIR, "datasets.pt"), weights_only=False)
         print(f"  Loaded: train {len(datasets['train_cs1'])+len(datasets['train_cs2'])}, "
               f"val {len(datasets['val_cs1'])+len(datasets['val_cs2'])}, "
               f"test {len(datasets['test_cs1'])+len(datasets['test_cs2'])}")
@@ -327,12 +334,12 @@ def main():
     bl_path = os.path.join(EXP_DIR, f"baselines{dws_suffix}.json")
     if os.path.exists(bl_path) and not args.baselines_only:
         with open(bl_path) as f:
-            baselines = json.load(f)
+            json.load(f)
         print(f"Baselines loaded from cache ({bl_path})")
     else:
         print()
-        baselines = run_and_cache_baselines(datasets, device, batch_size=args.baseline_batch_size,
-                                            da_window_steps=da_window_steps)
+        run_and_cache_baselines(datasets, device, batch_size=args.baseline_batch_size,
+                                 da_window_steps=da_window_steps)
 
     if args.baselines_only:
         return
@@ -356,7 +363,7 @@ def main():
     print(f"  DONE: {len(succeeded)}/{len(experiments)} successful")
     if failed:
         print(f"  Failed: {failed}")
-    print(f"\n  Run: python reports/generate_report.py")
+    print("\n  Run: python reports/generate_report.py")
 
 if __name__ == "__main__":
     main()

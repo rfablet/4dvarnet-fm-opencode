@@ -7,7 +7,11 @@ Usage:
     python train.py                                               # defaults (TweedieSolver)
     python train.py --config-name experiment/E1_direct_unet_default  # experiment preset
 """
-import os, sys, json, time
+import os
+import sys
+import json
+import time
+import logging
 import torch
 import numpy as np
 import hydra
@@ -15,16 +19,19 @@ from omegaconf import DictConfig, OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data.lorenz63 import Lorenz63Config, make_mixed_datasets, Lorenz63Dataset
-from data.random_param_dataset import RandomParamLorenz63Dataset
-from data.dataloader import FlowMatchingDataset, ConcatFMDataset, collate_fm
-from torch.utils.data import DataLoader
-from models.solver import TweedieSolver
-from models.direct_unet import DirectUNet
-from models.vanilla_cfm import VanillaCFM
-from training.pipeline import run_2stage_pipeline, create_trainer, train_stage
-from training.lightning_module import LitModel
-from evaluation.metrics import rmse
+logger = logging.getLogger(__name__)
+
+from data.lorenz63 import Lorenz63Config, make_mixed_datasets, make_s0_s1_trainval  # noqa: E402
+from data.random_param_dataset import RandomParamLorenz63Dataset  # noqa: E402
+from data.dataloader import FlowMatchingDataset, ConcatFMDataset, make_collate_fm  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+from models.solver import TweedieSolver  # noqa: E402
+from models.direct_unet import DirectUNet  # noqa: E402
+from models.vanilla_cfm import VanillaCFM  # noqa: E402
+from training.pipeline import create_trainer, train_stage  # noqa: E402
+from training.resume import load_init_weights, resolve_experiment_dir, resume_ckpt_path  # noqa: E402
+from training.lightning_module import LitModel  # noqa: E402
+from evaluation.metrics import rmse, param_rmse  # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 EXP_DIR = os.path.join(BASE, "experiments")
@@ -32,9 +39,16 @@ EXP_DIR = os.path.join(BASE, "experiments")
 
 def make_experiment_dataloaders(datasets, batch_size=32, train_mix="cs1+cs2",
                                 num_workers=4, randomize_params=False, param_noise=0.2,
-                                base_cfg=None, num_train_windows=1000):
-    kw = dict(batch_size=batch_size, collate_fn=collate_fm,
+                                base_cfg=None, num_train_windows=1000,
+                                data_setup="legacy", with_params=False, norm_stats=None):
+    kw = dict(batch_size=batch_size, collate_fn=make_collate_fm(norm_stats),
               num_workers=num_workers, pin_memory=True)
+    if data_setup == "s0_s1":
+        obs_cfg = {"obs_interval": base_cfg.obs_interval, "R_var": base_cfg.R_var} if base_cfg else {}
+        return {
+            "train": DataLoader(FlowMatchingDataset(datasets["train"], with_params=True, **obs_cfg), shuffle=True, **kw),
+            "val": DataLoader(FlowMatchingDataset(datasets["val"], with_params=True, **obs_cfg), shuffle=False, **kw),
+        }
     if randomize_params and base_cfg is not None:
         train_cs1 = RandomParamLorenz63Dataset(
             Lorenz63Config(**{**base_cfg.__dict__, "case": 1, "param_bias": 0.0,
@@ -59,6 +73,68 @@ def make_experiment_dataloaders(datasets, batch_size=32, train_mix="cs1+cs2",
     }
 
 
+def make_l96_dataloaders(datasets, batch_size=32, with_params=False,
+                         obs_interval=100, R_var=0.5, param_names=("F",),
+                         obs_var_indices=None, use_biased_params=False,
+                         resample_bias_draws=False, bias_max=0.2, norm_stats=None,
+                         noisy_da_bias=False, noisy_da_max=1.5, obs_density_cfg=None,
+                         with_true_forcing=False, obs_times_cfg=None):
+    # obs_density_cfg (see make_collate_fm) is TRAINING-only augmentation --
+    # val must stay at full canonical density so its loss/metrics remain
+    # comparable across epochs and against the eval protocol
+    # (eval_obs_density_l96.py sweeps density separately, at eval time, on
+    # top of a checkpoint trained with or without this augmentation).
+    kw = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
+    fm_kw = dict(obs_interval=obs_interval, R_var=R_var,
+                 with_params=with_params, param_names=list(param_names),
+                 obs_var_indices=obs_var_indices,
+                 use_biased_params=use_biased_params,
+                 resample_bias_draws=resample_bias_draws, bias_max=bias_max,
+                 noisy_da_bias=noisy_da_bias, noisy_da_max=noisy_da_max,
+                 with_true_forcing=with_true_forcing)
+    return {
+        "train": DataLoader(FlowMatchingDataset(datasets["train"], **fm_kw),
+                            shuffle=True,
+                            collate_fn=make_collate_fm(norm_stats, obs_density_cfg,
+                                                        with_true_forcing=with_true_forcing,
+                                                        obs_times_cfg=obs_times_cfg),
+                            **kw),
+        "val": DataLoader(FlowMatchingDataset(datasets["val"], **fm_kw),
+                          collate_fn=make_collate_fm(norm_stats, with_true_forcing=with_true_forcing),
+                          shuffle=False, **kw),
+    }
+
+
+PSC_TAU_OPTION_KEYS = ("tau0_frac", "tau0_zero_input", "tau_sampling", "tau_low_frac",
+                       "tau_low_max", "boot_frac", "boot_tau_min", "boot_tau_max",
+                       "boot_dtau_min", "boot_dtau_max", "boot_alpha",
+                       "var_weight", "var_tau_min", "var_tau_max", "var_fd_eps",
+                       "skip_connection", "skip_loss")
+
+
+def psc_tau_options(section) -> dict:
+    """The PredictStateCFM tau-consistency options present in a model config section."""
+    return {k: section.get(k) for k in PSC_TAU_OPTION_KEYS if section.get(k, None) is not None}
+
+
+def psc_teacher_options(cfg) -> dict:
+    """LitModel kwargs for the PredictStateCFM options: the EMA teacher (only if boot_ema_decay is
+    set) and the epoch at which the T5 variance loss switches on (var_start_epoch)."""
+    model_type = cfg.model.get("model_type", "")
+    if model_type not in ("predict_state_cfm", "monai_predict_state_cfm"):
+        return {}
+    section = cfg.model.get(model_type, None)
+    if section is None:
+        return {}
+    opts = {}
+    if section.get("boot_ema_decay", None) is not None:
+        opts.update(ema_decay=float(section.boot_ema_decay),
+                    teacher_start_epoch=int(section.get("boot_start_epoch", 0)))
+    if section.get("var_start_epoch", None) is not None:
+        opts["var_start_epoch"] = int(section.var_start_epoch)
+    return opts
+
+
 def model_factory(cfg: DictConfig, device: torch.device):
     model_type = cfg.model.get("model_type", "tweedie")
     if model_type == "tweedie":
@@ -75,13 +151,45 @@ def model_factory(cfg: DictConfig, device: torch.device):
         )
     elif model_type == "direct_unet":
         dc = cfg.model.direct_unet
+        param_dim = cfg.model.get("param_dim", 4)
         model = DirectUNet(
             state_dim=cfg.model.state_dim,
             hidden_channels=dc.hidden_channels,
             dropout=dc.dropout,
+            param_dim=param_dim,
+            cond_extra_dim=dc.get("cond_extra_dim", 1 + param_dim),
+        )
+    elif model_type == "monai_direct_unet":
+        from models.monai_unet_adapter import MonaiDirectUNet
+        mdu = cfg.model.monai_direct_unet
+        param_dim = cfg.model.get("param_dim", 4)
+        model = MonaiDirectUNet(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=mdu.hidden_channels,
+            dropout=mdu.get("dropout", 0.1),
+            param_dim=param_dim,
+            cond_extra_dim=mdu.get("cond_extra_dim", 1 + param_dim),
+            num_res_blocks=mdu.get("num_res_blocks", 2),
+            norm_num_groups=mdu.get("norm_num_groups", 32),
+        )
+    elif model_type == "monai_direct_unet_2d":
+        from models.monai_unet_l96_2d import MonaiDirectUNet2D
+        mdu = cfg.model.monai_direct_unet_2d
+        model = MonaiDirectUNet2D(
+            state_dim=cfg.model.state_dim,
+            NO=cfg.data.get("NO", 8),
+            hidden_channels=mdu.hidden_channels,
+            dropout=mdu.get("dropout", 0.1),
+            param_dim=cfg.model.get("param_dim", 0),
+            cond_extra_dim=mdu.get("cond_extra_dim", 0),
+            num_res_blocks=mdu.get("num_res_blocks", 2),
+            norm_num_groups=mdu.get("norm_num_groups", 8),
+            use_flash_attention=mdu.get("use_flash_attention", True),
+            mid_attention=mdu.get("mid_attention", "time"),
         )
     elif model_type == "vanilla_cfm":
         vc = cfg.model.vanilla_cfm
+        param_dim = cfg.model.get("param_dim", 4)
         model = VanillaCFM(
             state_dim=cfg.model.state_dim,
             hidden_channels=vc.hidden_channels,
@@ -89,42 +197,468 @@ def model_factory(cfg: DictConfig, device: torch.device):
             N_outer=vc.N_outer,
             sigma_prior=vc.sigma_prior,
             dropout=vc.dropout,
+            train_tau_0_only=vc.get("train_tau_0_only", False),
+            param_dim=param_dim,
+            cond_extra_dim=vc.get("cond_extra_dim", 1 + param_dim),
+        )
+    elif model_type == "monai_vanilla_cfm":
+        from models.monai_unet_adapter import MonaiVanillaCFM
+        mvc = cfg.model.monai_vanilla_cfm
+        param_dim = cfg.model.get("param_dim", 4)
+        model = MonaiVanillaCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=mvc.hidden_channels,
+            N_outer=mvc.N_outer,
+            sigma_prior=mvc.sigma_prior,
+            dropout=mvc.dropout,
+            train_tau_0_only=mvc.get("train_tau_0_only", False),
+            param_dim=param_dim,
+            cond_extra_dim=mvc.get("cond_extra_dim", 1 + param_dim),
+            num_res_blocks=mvc.get("num_res_blocks", 2),
+            norm_num_groups=mvc.get("norm_num_groups", 32),
+        )
+    elif model_type == "monai_predict_state_cfm":
+        from models.monai_unet_adapter import MonaiPredictStateCFM
+        mps = cfg.model.monai_predict_state_cfm
+        model = MonaiPredictStateCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=mps.hidden_channels,
+            N_outer=mps.N_outer,
+            sigma_prior=mps.sigma_prior,
+            dropout=mps.dropout,
+            train_tau_0_only=mps.get("train_tau_0_only", False),
+            param_dim=cfg.model.get("param_dim", 4),
+            cond_extra_dim=mps.get("cond_extra_dim", 0),
+            num_res_blocks=mps.get("num_res_blocks", 2),
+            norm_num_groups=mps.get("norm_num_groups", 32),
+            **psc_tau_options(mps),
+        )
+    elif model_type == "joint_cfm":
+        from models.vanilla_cfm import JointCFM
+        jc = cfg.model.joint_cfm
+        vc = cfg.model.vanilla_cfm
+        model = JointCFM(
+            state_dim=cfg.model.state_dim,
+            param_dim=jc.param_dim,
+            hidden_channels=vc.hidden_channels,
+            time_emb_dim=vc.time_emb_dim,
+            N_outer=vc.N_outer,
+            sigma_prior=vc.sigma_prior,
+            dropout=vc.dropout,
+            param_loss_weight=jc.param_loss_weight,
+            param_flow_channels=jc.get("param_flow_channels", None),
+            train_tau_0_only=jc.train_tau_0_only,
+            param_ref=jc.get("param_ref", None),
+            param_flow_pool=jc.get("param_flow_pool", "mean"),
+        )
+    elif model_type == "joint_cfm_coupled":
+        from models.vanilla_cfm import JointCFMCoupled
+        jcc = cfg.model.joint_cfm_coupled
+        vc = cfg.model.vanilla_cfm
+        model = JointCFMCoupled(
+            state_dim=cfg.model.state_dim,
+            param_dim=jcc.param_dim,
+            hidden_channels=vc.hidden_channels,
+            time_emb_dim=vc.time_emb_dim,
+            N_outer=vc.N_outer,
+            sigma_prior=vc.sigma_prior,
+            dropout=vc.dropout,
+            param_loss_weight=jcc.param_loss_weight,
+            param_flow_channels=jcc.get("param_flow_channels", None),
+            param_ref=jcc.get("param_ref", None),
+            param_flow_pool=jcc.get("param_flow_pool", "mean"),
+        )
+    elif model_type == "joint_direct_unet":
+        from models.direct_unet import JointDirectUNet
+        jdu = cfg.model.joint_direct_unet
+        dc = cfg.model.direct_unet
+        model = JointDirectUNet(
+            state_dim=cfg.model.state_dim,
+            param_dim=jdu.param_dim,
+            hidden_channels=dc.hidden_channels,
+            dropout=dc.dropout,
+            param_loss_weight=jdu.param_loss_weight,
+            param_head_channels=jdu.get("param_head_channels", None),
+            param_ref=jdu.get("param_ref", None),
+            param_head_pool=jdu.get("param_head_pool", "mean"),
+            param_head_backbone=jdu.get("param_head_backbone", "cnn"),
+        )
+    elif model_type == "param_head":
+        from models.param_head import StateParamModel
+        ph = cfg.model.param_head
+        model = StateParamModel(
+            state_dim=cfg.model.state_dim,
+            param_dim=ph.param_dim,
+            state_checkpoint=ph.get("state_checkpoint", None),
+            state_model_type=ph.get("state_model_type", "direct_unet"),
+            state_hidden_channels=ph.get("state_hidden_channels", None),
+            state_cond_extra_dim=ph.get("state_cond_extra_dim", 0),
+            param_head_channels=ph.get("param_head_channels", None),
+            param_ref=ph.get("param_ref", None),
+            param_head_pool=ph.get("param_head_pool", "mean"),
+            state_source=ph.get("state_source", "l1b"),
+            augment_derivatives=ph.get("augment_derivatives", False),
+            device=device,
+        )
+    elif model_type == "param_head_unet":
+        from models.param_head import StateParamModel
+        ph = cfg.model.param_head_unet
+        model = StateParamModel(
+            state_dim=cfg.model.state_dim,
+            param_dim=ph.param_dim,
+            state_checkpoint=ph.get("state_checkpoint", None),
+            state_model_type=ph.get("state_model_type", "direct_unet"),
+            state_hidden_channels=ph.get("state_hidden_channels", None),
+            state_cond_extra_dim=ph.get("state_cond_extra_dim", 0),
+            param_head_channels=ph.get("param_head_channels", None),
+            param_ref=ph.get("param_ref", None),
+            param_head_pool=ph.get("param_head_pool", "mean"),
+            state_source=ph.get("state_source", "l1b"),
+            backbone="unet",
+            unet_hidden_channels=ph.get("hidden_channels", None),
+            device=device,
+        )
+    elif model_type == "predict_state_cfm":
+        from models.vanilla_cfm import PredictStateCFM
+        psc = cfg.model.predict_state_cfm
+        param_dim = cfg.model.get("param_dim", 4)
+        model = PredictStateCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=psc.hidden_channels,
+            time_emb_dim=psc.time_emb_dim,
+            N_outer=psc.N_outer,
+            sigma_prior=psc.sigma_prior,
+            dropout=psc.dropout,
+            train_tau_0_only=psc.get("train_tau_0_only", False),
+            param_dim=param_dim,
+            cond_extra_dim=psc.cond_extra_dim,
+            **psc_tau_options(psc),
+        )
+    elif model_type == "tweedie_cfm":
+        from models.vanilla_cfm import TweedieCFM
+        tc = cfg.model.tweedie_cfm
+        param_dim = cfg.model.get("param_dim", 4)
+        model = TweedieCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=tc.hidden_channels,
+            time_emb_dim=tc.time_emb_dim,
+            K_inner=tc.K_inner,
+            N_outer=tc.N_outer,
+            sigma_prior=tc.sigma_prior,
+            dropout=tc.dropout,
+            train_tau_0_only=tc.train_tau_0_only,
+            cond_extra_dim=tc.cond_extra_dim,
+        )
+    elif model_type == "sda_prior":
+        from models.sda import UnconditionalPriorCFM
+        sp = cfg.model.sda_prior
+        model = UnconditionalPriorCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=sp.hidden_channels,
+            time_emb_dim=sp.time_emb_dim,
+            N_outer=sp.N_outer,
+            sigma_prior=sp.sigma_prior,
+            dropout=sp.dropout,
+        )
+    elif model_type == "sda_prior_cond":
+        from models.sda import ConditionalPriorCFM
+        sp = cfg.model.sda_prior
+        model = ConditionalPriorCFM(
+            state_dim=cfg.model.state_dim,
+            param_dim=cfg.model.get("param_dim", 8),
+            hidden_channels=sp.hidden_channels,
+            time_emb_dim=sp.time_emb_dim,
+            N_outer=sp.N_outer,
+            sigma_prior=sp.sigma_prior,
+            dropout=sp.dropout,
+        )
+    elif model_type == "monai_sda_prior":
+        from models.monai_unet_adapter import MonaiUnconditionalPriorCFM
+        sp = cfg.model.monai_sda_prior
+        model = MonaiUnconditionalPriorCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=sp.hidden_channels,
+            N_outer=sp.N_outer,
+            sigma_prior=sp.sigma_prior,
+            dropout=sp.dropout,
+            num_res_blocks=sp.get("num_res_blocks", 2),
+            norm_num_groups=sp.get("norm_num_groups", 32),
+        )
+    elif model_type == "monai_sda_prior_cond":
+        from models.monai_unet_adapter import MonaiConditionalPriorCFM
+        sp = cfg.model.monai_sda_prior
+        model = MonaiConditionalPriorCFM(
+            state_dim=cfg.model.state_dim,
+            param_dim=cfg.model.get("param_dim", 8),
+            hidden_channels=sp.hidden_channels,
+            N_outer=sp.N_outer,
+            sigma_prior=sp.sigma_prior,
+            dropout=sp.dropout,
+            num_res_blocks=sp.get("num_res_blocks", 2),
+            norm_num_groups=sp.get("norm_num_groups", 32),
+        )
+    elif model_type == "fourdvarnet":
+        from models.fourdvarnet import FourDVarNetSolver
+        fdv = cfg.model.fdv
+        # full_state_target=True (default False, backward-compatible; only
+        # meaningful for update_input="subgrad+state+trueprior"): recomputes
+        # the SAME obs_var_indices formula used at data-loading time (see
+        # the "with_params"/"dataloader_obs_var_indices" block above) from
+        # cfg.data.NO/J/obs_j directly -- must match exactly, since it says
+        # which of state_dim's (here the FULL physical state) channels
+        # observation actually covers.
+        model_obs_var_indices = None
+        true_dynamics_dt = None
+        if fdv.get("full_state_target", False):
+            fdc = cfg.data
+            fNO, fJ, fobs_j = fdc.get("NO", 8), fdc.get("J", 4), fdc.get("obs_j", 2)
+            if fobs_j < fJ:
+                fX_idx = list(range(fNO))
+                fY_idx = [fNO + k * fJ + j for k in range(fNO) for j in range(fobs_j)]
+                model_obs_var_indices = tuple(fX_idx + fY_idx)
+            true_dynamics_dt = fdc.dt
+        model = FourDVarNetSolver(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=fdv.hidden_channels,
+            time_emb_dim=fdv.time_emb_dim,
+            N_outer=fdv.N_outer,
+            dropout=fdv.dropout,
+            update_input=fdv.update_input,
+            R_var=fdv.get("R_var", 0.5),
+            prior_weight=fdv.get("prior_weight", 1.0),
+            clip_range=fdv.get("clip_range", 50.0),
+            trainable_prior_weight=fdv.get("trainable_prior_weight", True),
+            aux_var_cost_weight=fdv.get("aux_var_cost_weight", 0.0),
+            prior_tau_conditioning=fdv.get("prior_tau_conditioning", False),
+            unet_backbone=fdv.get("unet_backbone", "unet1d"),
+            monai_norm_num_groups=fdv.get("monai_norm_num_groups", 32),
+            monai_num_res_blocks=fdv.get("monai_num_res_blocks", 2),
+            prior_hidden_channels=fdv.get("prior_hidden_channels", None),
+            tbptt_n_blocks=fdv.get("tbptt_n_blocks", 1),
+            tbptt_block_size=fdv.get("tbptt_block_size", None),
+            grad_clip_range=fdv.get("grad_clip_range", None),
+            init_state_var=fdv.get("init_state_var", 0.0),
+            gradsplit_prior_scale=fdv.get("gradsplit_prior_scale", 1.0),
+            prior_residual=fdv.get("prior_residual", False),
+            prior_dropout=fdv.get("prior_dropout", None),
+            prior_output_init_std=fdv.get("prior_output_init_std", 0.0),
+            detach_var_cost_grad=fdv.get("detach_var_cost_grad", False),
+            zero_prior_input=fdv.get("zero_prior_input", False),
+            aux_detach_x_final=fdv.get("aux_detach_x_final", False),
+            update_head=fdv.get("update_head", "direct"),
+            freeze_prior_in_solver=fdv.get("freeze_prior_in_solver", False),
+            prior_solver_grad_scale=fdv.get("prior_solver_grad_scale", 1.0),
+            tau_schedule=fdv.get("tau_schedule", "linear"),
+            tau_scale=fdv.get("tau_scale", 5.0),
+            burnin_prob=fdv.get("burnin_prob", 0.0),
+            burnin_max=fdv.get("burnin_max", 0),
+            burnin_start_epoch=fdv.get("burnin_start_epoch", 0),
+            burnin_ramp_epochs=fdv.get("burnin_ramp_epochs", 0),
+            train_n_blocks=fdv.get("train_n_blocks", 1),
+            gain_init=fdv.get("gain_init", 0.5),
+            obs_var_indices=model_obs_var_indices,
+            true_dynamics_dt=true_dynamics_dt,
+            loss_type=fdv.get("loss_type", "mse"),
+            var_cost_Q_var=fdv.get("var_cost_Q_var", 0.05),
+        )
+    elif model_type == "fourdvarnet_cfm":
+        from models.fourdvarnet import FourDVarNetPredictStateCFM
+        fc = cfg.model.fdv_cfm
+        model = FourDVarNetPredictStateCFM(
+            state_dim=cfg.model.state_dim,
+            hidden_channels=fc.hidden_channels,
+            time_emb_dim=fc.time_emb_dim,
+            N_outer=fc.N_outer,
+            K_inner=fc.K_inner,
+            sigma_prior=fc.sigma_prior,
+            dropout=fc.dropout,
+            train_tau_0_only=fc.train_tau_0_only,
+            update_input=fc.update_input,
+            clip_range=fc.get("clip_range", 50.0),
+            R_var=fc.get("R_var", 0.5),
+            obs_weight=fc.get("obs_weight", 1.0),
+            min_obs_weight=fc.get("min_obs_weight", 1e-3),
+            trainable_obs_weight=fc.get("trainable_obs_weight", True),
+            grad_clip_range=fc.get("grad_clip_range", None),
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+    section = cfg.model.get(model_type, None) if model_type in (
+        "vanilla_cfm", "monai_vanilla_cfm", "predict_state_cfm", "monai_predict_state_cfm") else None
+    if section is not None and section.get("step_power", None) is not None:
+        model.step_power = float(section.step_power)
     return model.to(device)
 
 
-def evaluate_model(model, dataset, device, model_type="tweedie"):
+def _make_eval_batch(w, device, param_names=("sigma", "rho", "beta", "c1"),
+                     param_dim=4, use_biased_params=False, obs_var_indices=None,
+                     with_true_forcing=False, norm_stats=None):
+    from data.dataloader import FlowMatchingBatch, _l96_biased_param_vector
+    states = w["true_state"].unsqueeze(0).to(device)
+    if obs_var_indices is not None and states.shape[-1] != len(obs_var_indices):
+        states = states[..., obs_var_indices]
+    obs = w["obs"].unsqueeze(0).to(device)
+    if norm_stats is not None:
+        from data.normalization import normalize
+        states, obs = normalize(states, norm_stats), normalize(obs, norm_stats)
+    mask = w["obs_mask"].unsqueeze(0).to(device)
+    forcing = w["forcing_corrupted"].unsqueeze(0).to(device)
+    true_forcing = w["forcing_true"].unsqueeze(0).to(device) if with_true_forcing else None
+    if param_dim == 0 and not with_true_forcing:
+        return FlowMatchingBatch(states, obs, mask, forcing)
+    params = None
+    if param_dim > 0:
+        if use_biased_params:
+            params = torch.tensor([_l96_biased_param_vector(w)],
+                                  dtype=torch.float32, device=device)
+        else:
+            params = torch.tensor([[w.get(nm, 0.0) for nm in param_names]],
+                                  dtype=torch.float32, device=device)
+    if param_names == ["F", "c1", "hx", "eps", "w1", "w2", "w3", "w4"]:
+        from data.dataloader import _l96_true_param_vector
+        true_param_vec = _l96_true_param_vector(w)
+    else:
+        true_param_vec = [w.get(f"true_{nm}", w.get(nm, 0.0)) for nm in param_names]
+    true_params = torch.tensor([true_param_vec],
+                               dtype=torch.float32, device=device)
+    return FlowMatchingBatch(states, obs, mask, forcing, params=params, true_params=true_params,
+                             true_forcing=true_forcing)
+
+
+def _eval_true_param_list(w, param_names):
+    if list(param_names) == ["F", "c1", "hx", "eps", "w1", "w2", "w3", "w4"]:
+        from data.dataloader import _l96_true_param_vector
+        return list(_l96_true_param_vector(w))
+    return [w.get(f"true_{nm}", w.get(nm, 0.0)) for nm in param_names]
+
+
+def evaluate_model(model, dataset, device, model_type="tweedie", return_params=False,
+                   param_names=("sigma", "rho", "beta", "c1"), param_dim=4,
+                   obs_var_indices=None, use_biased_params=False, with_true_forcing=False,
+                   norm_stats=None):
     rmse_list = []
+    param_list = []
+    true_param_list = []
     for i in range(len(dataset)):
         w = dataset[i]
-        obs = w["obs"].unsqueeze(0).to(device)
+        batch = _make_eval_batch(w, device, param_names=param_names, param_dim=param_dim,
+                                 use_biased_params=use_biased_params,
+                                 obs_var_indices=obs_var_indices,
+                                 with_true_forcing=with_true_forcing,
+                                 norm_stats=norm_stats)
         if model_type == "tweedie":
-            pred = model(obs).detach().cpu().numpy()[0]
-        elif model_type == "direct_unet":
-            pred = model(obs).detach().cpu().numpy()[0]
-        elif model_type == "vanilla_cfm":
-            pred = model.sample(obs).detach().cpu().numpy()[0]
+            pred = model(batch.obs).detach().cpu().numpy()[0]
+        elif model_type in ("direct_unet", "monai_direct_unet", "monai_direct_unet_2d"):
+            pred = model(batch).detach().cpu().numpy()[0]
+        elif model_type in ("vanilla_cfm", "monai_vanilla_cfm"):
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "joint_cfm":
+            pred, params = model.sample(batch, return_params=True)
+            pred = pred.detach().cpu().numpy()[0]
+            param_list.append(params.detach().cpu().numpy()[0])
+            tp = _eval_true_param_list(w, param_names)
+            true_param_list.append(np.array(tp))
+        elif model_type == "joint_cfm_coupled":
+            pred, params = model.sample(batch, return_params=True)
+            pred = pred.detach().cpu().numpy()[0]
+            param_list.append(params.detach().cpu().numpy()[0])
+            tp = _eval_true_param_list(w, param_names)
+            true_param_list.append(np.array(tp))
+        elif model_type == "joint_direct_unet":
+            pred, params = model.sample(batch, return_params=True)
+            pred = pred.detach().cpu().numpy()[0]
+            param_list.append(params.detach().cpu().numpy()[0])
+            tp = _eval_true_param_list(w, param_names)
+            true_param_list.append(np.array(tp))
+        elif model_type in ("param_head", "param_head_unet"):
+            pred, params = model(batch)
+            pred = pred.detach().cpu().numpy()[0]
+            param_list.append(params.detach().cpu().numpy()[0])
+            tp = _eval_true_param_list(w, param_names)
+            true_param_list.append(np.array(tp))
+        elif model_type in ("predict_state_cfm", "monai_predict_state_cfm"):
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "tweedie_cfm":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type in ("sda_prior", "sda_prior_cond", "monai_sda_prior", "monai_sda_prior_cond"):
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "fourdvarnet":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "fourdvarnet_cfm":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        if norm_stats is not None:
+            from data.normalization import denormalize
+            pred = denormalize(pred, norm_stats)
         truth = w["true_state"].numpy()
+        if obs_var_indices is not None and pred.shape[-1] != truth.shape[-1]:
+            truth = truth[..., obs_var_indices]
         rmse_list.append(rmse(pred, truth))
     all_rmse = np.stack(rmse_list, axis=0)
-    return np.mean(all_rmse, axis=0), np.std(all_rmse, axis=0)
+    out = (np.mean(all_rmse, axis=0), np.std(all_rmse, axis=0))
+    if return_params and len(param_list) > 0:
+        pred_params = np.stack(param_list, axis=0)
+        true_params = np.stack(true_param_list, axis=0)
+        prmse = param_rmse(pred_params, true_params)
+        return out + (prmse,)
+    return out
 
 
-def save_trajectories(model, dataset, device, model_type, save_path):
+def _per_group_rmse(mean_rmse, obs_var_indices, NO=8, J=4, obs_j=2):
+    groups = {}
+    groups["all_obs"] = float(np.mean(mean_rmse))
+    groups["slow"] = float(np.mean(mean_rmse[:NO]))
+    if obs_j < J:
+        groups["obs_fast"] = float(np.mean(mean_rmse[NO:]))
+    else:
+        groups["obs_fast"] = float(np.mean(mean_rmse[NO:]))
+    return groups
+
+
+def save_trajectories(model, dataset, device, model_type, save_path,
+                      param_names=("sigma", "rho", "beta", "c1"), param_dim=4,
+                      obs_var_indices=None, use_biased_params=False, with_true_forcing=False,
+                      norm_stats=None):
     trajs, truths = [], []
     for i in range(len(dataset)):
         w = dataset[i]
-        obs = w["obs"].unsqueeze(0).to(device)
+        batch = _make_eval_batch(w, device, param_names=param_names, param_dim=param_dim,
+                                 use_biased_params=use_biased_params,
+                                 obs_var_indices=obs_var_indices,
+                                 with_true_forcing=with_true_forcing,
+                                 norm_stats=norm_stats)
         if model_type == "tweedie":
-            pred = model(obs).detach().cpu().numpy()[0]
-        elif model_type == "direct_unet":
-            pred = model(obs).detach().cpu().numpy()[0]
-        elif model_type == "vanilla_cfm":
-            pred = model.sample(obs).detach().cpu().numpy()[0]
+            pred = model(batch.obs).detach().cpu().numpy()[0]
+        elif model_type in ("direct_unet", "monai_direct_unet", "monai_direct_unet_2d"):
+            pred = model(batch).detach().cpu().numpy()[0]
+        elif model_type in ("vanilla_cfm", "monai_vanilla_cfm"):
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "joint_cfm":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "joint_cfm_coupled":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "joint_direct_unet":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type in ("param_head", "param_head_unet"):
+            pred, _ = model(batch)
+            pred = pred.detach().cpu().numpy()[0]
+        elif model_type in ("predict_state_cfm", "monai_predict_state_cfm"):
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "tweedie_cfm":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type in ("sda_prior", "sda_prior_cond", "monai_sda_prior", "monai_sda_prior_cond"):
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "fourdvarnet":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        elif model_type == "fourdvarnet_cfm":
+            pred = model.sample(batch).detach().cpu().numpy()[0]
+        if norm_stats is not None:
+            from data.normalization import denormalize
+            pred = denormalize(pred, norm_stats)
+        truth = w["true_state"].numpy()
+        if obs_var_indices is not None and pred.shape[-1] != truth.shape[-1]:
+            truth = truth[..., obs_var_indices]
         trajs.append(pred)
-        truths.append(w["true_state"].numpy())
+        truths.append(truth)
     np.savez_compressed(save_path,
                         trajectories=np.stack(trajs, axis=0),
                         truths=np.stack(truths, axis=0))
@@ -132,6 +666,9 @@ def save_trajectories(model, dataset, device, model_type, save_path):
 
 @hydra.main(config_path="config", config_name="lorenz63_default", version_base="1.3")
 def main(cfg: DictConfig):
+    # Training only: set here, not at import, so importing train (evaluation, tests)
+    # does not switch float32 matmuls to bfloat16 process-wide.
+    torch.set_float32_matmul_precision('medium')
     print(OmegaConf.to_yaml(cfg))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,16 +679,26 @@ def main(cfg: DictConfig):
     train_mix = cfg.data.get("train_mix", "cs1+cs2")
     randomize_params = cfg.data.get("randomize_params", False)
     param_noise = cfg.data.get("param_noise", 0.2)
+    data_setup = cfg.data.get("data_setup", "legacy")
     exp_id = cfg.get("experiment_id", f"{model_type}_custom")
     from hydra.core.hydra_config import HydraConfig
     hcfg = HydraConfig.get()
     if hcfg and hcfg.job.config_name and hcfg.job.config_name.startswith("experiment/"):
         exp_id = hcfg.job.config_name.replace("experiment/", "")
+    if cfg.training.get("seed", None) is not None:
+        exp_id = f"{exp_id}_seed{int(cfg.training.seed)}"
 
     exp_dir = os.path.join(EXP_DIR, exp_id)
+    resolve_experiment_dir(exp_dir, cfg, fresh=cfg.get("fresh", False))
     os.makedirs(exp_dir, exist_ok=True)
     results_path = os.path.join(exp_dir, "results.json")
-    trajs_path = os.path.join(exp_dir, "trajectories.npz")
+
+    # Persist the fully-resolved (defaults-composed) config next to the
+    # checkpoints unconditionally, so eval scripts can recover exactly what a
+    # given checkpoint was trained with instead of reverse-engineering
+    # architecture from state-dict shapes. Written before the skip-check below
+    # so re-running against an already-completed experiment still backfills it.
+    OmegaConf.save(cfg, os.path.join(exp_dir, "resolved_config.yaml"), resolve=True)
 
     if os.path.exists(results_path):
         print(f"  Results exist at {results_path}, skipping.")
@@ -159,40 +706,226 @@ def main(cfg: DictConfig):
 
     # Data
     dc = cfg.data
-    base_cfg = Lorenz63Config(
-        dt=dc.dt, T_max=dc.T_max, obs_interval=dc.obs_interval,
-        R_var=dc.R_var, B_var=dc.B_var,
-        num_windows=dc.num_windows, window_spacing=dc.window_spacing,
-        spinup_steps=dc.spinup_steps, seed=dc.get("seed", 42),
-        sigma_true=dc.sigma_true, rho_true=dc.rho_true, beta_true=dc.beta_true,
-        gamma=dc.gamma, W_L_bar=dc.W_L_bar, c1=dc.c1, c2=dc.c2,
-        sigma_0=dc.sigma_0, sigma_L=dc.sigma_L,
-        tau_eta=dc.tau_eta, sigma_eta=dc.sigma_eta,
-        param_bias=dc.get("param_bias", 0.0),
-        forcing_state_bias=dc.get("forcing_state_bias", 0.0),
-        forcing_coupling=dc.get("forcing_coupling", "linear"),
-    )
-    datasets = make_mixed_datasets(
-        base_cfg,
-        num_train_windows=dc.get("num_train_windows", 1000),
-        num_val_windows=dc.get("num_val_windows", 100),
-        num_test_windows=dc.get("num_test_windows", 200),
-        include_randparam_test=dc.get("test_randparam", True),
-        param_noise=dc.get("test_param_noise", 0.2),
-    )
-    loaders = make_experiment_dataloaders(
-        datasets, batch_size=cfg.training.batch_size,
-        train_mix=train_mix, num_workers=4,
-        randomize_params=randomize_params, param_noise=param_noise,
-        base_cfg=base_cfg,
-        num_train_windows=dc.get("num_train_windows", 1000),
-    )
+    system = dc.get("system", "lorenz63")
+    obs_var_indices = None
+    eval_norm_stats = None
+    param_names = tuple(dc.get("param_names", ["sigma", "rho", "beta", "c1"]))
+    if system == "lorenz96":
+        from data.lorenz96 import (Lorenz96Config, make_l96_s0_s1_trainval,
+                                   make_datasets as make_l96_datasets)
+        NO = dc.get("NO", 8)
+        J = dc.get("J", 4)
+        obs_j = dc.get("obs_j", 2)
+        obs_var_indices = None
+        if obs_j < J:
+            X_idx = list(range(NO))
+            Y_idx = []
+            for k in range(NO):
+                for j in range(obs_j):
+                    Y_idx.append(NO + k * J + j)
+            obs_var_indices = tuple(X_idx + Y_idx)
+        base_cfg = Lorenz96Config(
+            case=dc.get("case", 1), dt=dc.dt, T_max=dc.T_max,
+            obs_interval=dc.obs_interval, R_var=dc.R_var, B_var=dc.B_var,
+            param_bias=dc.get("param_bias", 0.0),
+            num_windows=dc.num_windows, window_spacing=dc.window_spacing,
+            spinup_steps=dc.spinup_steps, seed=dc.get("seed", 42),
+            NO=dc.get("NO", 8), J=dc.get("J", 4),
+            h=dc.get("h", 1.0), hx=dc.get("hx", 1.0), eps=dc.get("eps", 0.1),
+            F_true=dc.get("F_true", 8.0), F_da=dc.get("F_da", 8.0),
+            gamma=dc.get("gamma", 0.05), W_L_bar=dc.get("W_L_bar", 0.0),
+            c1=dc.get("c1", 1.0), c2=dc.get("c2", 0.1),
+            sigma_0=dc.get("sigma_0", 0.08), sigma_L=dc.get("sigma_L", 0.20),
+            tau_eta=dc.get("tau_eta", 5.0),
+            sigma_eta=dc.get("sigma_eta", np.sqrt(0.5)),
+            forcing_state_bias=dc.get("forcing_state_bias", 0.0),
+            forcing_coupling=dc.get("forcing_coupling", "linear"),
+            coupling_exponent_truth=dc.get("coupling_exponent_truth", 1.6),
+            coupling_exponent_da=dc.get("coupling_exponent_da", 1.0),
+            fast_weights=list(dc.get("fast_weights", [1.0, 1.0, 0.1, 0.1])),
+            randomize=dict(dc.get("randomize", {})),
+            obs_var_indices=obs_var_indices,
+        )
+        if data_setup == "s0_s1":
+            smoke_cached_data = dc.get("smoke_cached_data", None)
+            if smoke_cached_data is not None:
+                logger.info(f"Loading cached data from: {smoke_cached_data}")
+                cached = torch.load(smoke_cached_data, weights_only=False)
+                datasets = cached
+                logger.info(f"  train: {len(cached['train'])} windows, val: {len(cached['val'])} windows")
+                test_keys = ["test_s0", "test_s1"]
+            else:
+                test_cache_path = dc.get("test_cache", None)
+                cached_test = None
+                if test_cache_path and os.path.exists(test_cache_path):
+                    logger.info(f"Reusing cached test splits from {test_cache_path}")
+                    cached_full = torch.load(test_cache_path, weights_only=False)
+                    cached_test = {k: cached_full[k] for k in ("test_s0", "test_s1")
+                                   if k in cached_full}
+                trainval_kwargs = dict(
+                    num_train_windows=dc.get("num_train_windows", 1000),
+                    num_val_windows=dc.get("num_val_windows", 100),
+                    num_test_windows=dc.get("num_test_windows", 200),
+                    param_noise=dc.get("test_param_noise", 0.2),
+                    bias_range=(0.0, dc.get("bias_max", 0.2)),
+                    cached_datasets=cached_test,
+                    train_forcing_state_bias=dc.get("train_forcing_state_bias", 0.1),
+                )
+                train_cache = dc.get("train_cache", None)
+                if train_cache:
+                    from data.lorenz96 import make_l96_s0_s1_trainval_cached
+                    logger.info(f"data.train_cache={train_cache} "
+                                f"({'reusing' if os.path.exists(train_cache) else 'generating and saving'})")
+                    datasets = make_l96_s0_s1_trainval_cached(base_cfg, train_cache=train_cache,
+                                                              **trainval_kwargs)
+                else:
+                    datasets = make_l96_s0_s1_trainval(base_cfg, **trainval_kwargs)
+                test_keys = ["test_s0", "test_s1"]
+        else:
+            datasets = make_l96_datasets(base_cfg)
+            test_keys = ["test_cs1", "test_cs2"]
+    else:
+        base_cfg = Lorenz63Config(
+            dt=dc.dt, T_max=dc.T_max, obs_interval=dc.obs_interval,
+            R_var=dc.R_var, B_var=dc.B_var,
+            num_windows=dc.num_windows, window_spacing=dc.window_spacing,
+            spinup_steps=dc.spinup_steps, seed=dc.get("seed", 42),
+            sigma_true=dc.sigma_true, rho_true=dc.rho_true, beta_true=dc.beta_true,
+            gamma=dc.gamma, W_L_bar=dc.W_L_bar, c1=dc.c1, c2=dc.c2,
+            sigma_0=dc.sigma_0, sigma_L=dc.sigma_L,
+            tau_eta=dc.tau_eta, sigma_eta=dc.sigma_eta,
+            param_bias=dc.get("param_bias", 0.0),
+            forcing_state_bias=dc.get("forcing_state_bias", 0.0),
+            forcing_coupling=dc.get("forcing_coupling", "linear"),
+        )
+        if data_setup == "s0_s1":
+            smoke_cached_data = dc.get("smoke_cached_data", None)
+            if smoke_cached_data is not None:
+                logger.info(f"Loading cached data from: {smoke_cached_data}")
+                cached = torch.load(smoke_cached_data, weights_only=False)
+                datasets = cached
+                logger.info(f"  train: {len(cached['train'])} windows, val: {len(cached['val'])} windows")
+                test_keys = ["test_s0", "test_s1"]
+            else:
+                bias_max = dc.get("bias_max", 0.2)
+                datasets = make_s0_s1_trainval(
+                    base_cfg,
+                    num_train_windows=dc.get("num_train_windows", 1000),
+                    num_val_windows=dc.get("num_val_windows", 100),
+                    num_test_windows=dc.get("num_test_windows", 200),
+                    param_noise=dc.get("test_param_noise", 0.2),
+                    bias_range=(0.0, bias_max),
+                )
+                test_keys = ["test_s0", "test_s1"]
+        else:
+            datasets = make_mixed_datasets(
+                base_cfg,
+                num_train_windows=dc.get("num_train_windows", 1000),
+                num_val_windows=dc.get("num_val_windows", 100),
+                num_test_windows=dc.get("num_test_windows", 200),
+                include_randparam_test=dc.get("test_randparam", True),
+                param_noise=dc.get("test_param_noise", 0.2),
+            )
+            test_keys = ["test_cs1", "test_cs2", "test_cs3", "test_cs4"]
+    if system == "lorenz96":
+        norm_stats = None
+        if dc.get("normalize", False):
+            from data.normalization import load_norm_stats
+            norm_stats_path = dc.get("norm_stats_path",
+                                      os.path.join(EXP_DIR, "l96_norm_stats_obsj2.pt"))
+            norm_stats = load_norm_stats(norm_stats_path)
+            logger.info(f"data.normalize=True: loaded per-channel stats from {norm_stats_path}")
+        obs_density_cfg = None
+        if dc.get("obs_density_augment", False):
+            obs_density_cfg = {
+                "full_prob": dc.get("obs_density_full_prob", 0.4),
+                "min_keep": dc.get("obs_density_min_keep", 0),
+            }
+            logger.info(f"data.obs_density_augment=True: {obs_density_cfg}")
+        obs_times_cfg = None
+        obs_modes = [k for k in ("obs_times_random", "obs_noise_redraw", "obs_random_layout")
+                     if dc.get(k, False)]
+        if len(obs_modes) > 1:
+            raise ValueError(f"data.{' / data.'.join(obs_modes)} are mutually exclusive")
+        if dc.get("obs_times_random", False):
+            obs_times_cfg = {"R_var": dc.R_var, "mode": "stratified"}
+            logger.info(f"data.obs_times_random=True (stratified, train only): {obs_times_cfg}")
+        elif dc.get("obs_noise_redraw", False):
+            obs_times_cfg = {"R_var": dc.R_var, "mode": "noise_only"}
+            logger.info(f"data.obs_noise_redraw=True (regular grid, train only): {obs_times_cfg}")
+        elif dc.get("obs_random_layout", False):
+            obs_times_cfg = {"R_var": dc.R_var, "mode": "variable",
+                             "n_obs_range": list(dc.get("obs_n_range", [5, 50])),
+                             "fast_range": list(dc.get("obs_fast_range", [4, 16])),
+                             "first_step": bool(dc.get("obs_first_step", False))}
+            logger.info(f"data.obs_random_layout=True (train only): {obs_times_cfg}")
+        if dc.get("val_obs_random_layout", False):
+            from data.obs_times import reobserve_windows_fixed
+            val_idx = obs_var_indices if obs_var_indices is not None else tuple(range(base_cfg.obs_dim))
+            reobserve_windows_fixed(
+                datasets["val"], val_idx, R_var=dc.R_var,
+                n_obs_range=tuple(dc.get("obs_n_range", [5, 50])),
+                fast_range=tuple(dc.get("obs_fast_range", [4, 16])),
+                seed=int(dc.get("val_obs_seed", 20260923)),
+                first_step=bool(dc.get("obs_first_step", False)))
+            logger.info("data.val_obs_random_layout=True: val windows re-observed once "
+                        "(fixed seed) with the random observing system")
+        # full_state_target=True (default False, backward-compatible): pass
+        # obs_var_indices=None to FlowMatchingDataset specifically (NOT to
+        # base_cfg above, which still needs the real obs_var_indices to
+        # generate 24D obs/obs_mask) -- FlowMatchingDataset.__getitem__ only
+        # slices `true_state` to obs_var_indices when given one, so this
+        # keeps `states`/`true_state` at the FULL physical state dimension
+        # (e.g. 40D for NO=8,J=4) while obs/obs_mask stay 24D as generated.
+        # For models (like FourDVarNetSolver's subgrad+state+trueprior) that
+        # need the true full state to run the actual physical dynamics
+        # in-line, which cannot operate on a partially-observed subspace.
+        dataloader_obs_var_indices = None if dc.get("full_state_target", False) else obs_var_indices
+        loaders = make_l96_dataloaders(
+            datasets, batch_size=cfg.training.batch_size,
+            obs_interval=dc.obs_interval, R_var=dc.R_var,
+            param_names=param_names,
+            with_params=(model_type in ("joint_cfm", "joint_cfm_coupled", "joint_direct_unet", "param_head", "param_head_unet", "sda_prior_cond", "monai_sda_prior_cond")
+                        or dc.get("with_params", False)),
+            obs_var_indices=dataloader_obs_var_indices,
+            use_biased_params=(model_type in ("param_head", "param_head_unet")
+                               or dc.get("use_biased_params", False)),
+            resample_bias_draws=dc.get("resample_bias_draws", False),
+            bias_max=dc.get("bias_max", 0.2),
+            norm_stats=norm_stats,
+            noisy_da_bias=dc.get("noisy_da_bias", False),
+            noisy_da_max=dc.get("noisy_da_max", 1.5),
+            obs_density_cfg=obs_density_cfg,
+            with_true_forcing=dc.get("with_true_forcing", False),
+            obs_times_cfg=obs_times_cfg,
+        )
+    else:
+        if dc.get("normalize", False):
+            from data.normalization import load_norm_stats
+            norm_stats_path = dc.get("norm_stats_path", os.path.join(EXP_DIR, "l63_norm_stats.pt"))
+            eval_norm_stats = load_norm_stats(norm_stats_path)
+            logger.info(f"data.normalize=True: loaded per-channel stats from {norm_stats_path}")
+        loaders = make_experiment_dataloaders(
+            datasets, batch_size=cfg.training.batch_size, norm_stats=eval_norm_stats,
+            train_mix=train_mix, num_workers=4,
+            randomize_params=randomize_params, param_noise=param_noise,
+            base_cfg=base_cfg,
+            num_train_windows=dc.get("num_train_windows", 1000),
+            data_setup=data_setup,
+            with_params=(model_type in ("joint_cfm", "joint_cfm_coupled", "joint_direct_unet")),
+        )
 
     print(f"  Train: {len(loaders['train'].dataset)}, Val: {len(loaders['val'].dataset)}")
 
     # Model
+    train_seed = cfg.training.get("seed", None)
+    if train_seed is not None:
+        import pytorch_lightning as pl
+        pl.seed_everything(int(train_seed), workers=True)
+        logger.info(f"training.seed={train_seed}: model init, batch order and per-batch obs draws seeded")
     print(f"  Creating model (type={model_type})...")
     model = model_factory(cfg, device)
+    param_dim = cfg.model.get("param_dim", 4)
 
     # Train
     total_t0 = time.time()
@@ -212,9 +945,18 @@ def main(cfg: DictConfig):
                 lit = LitModel(model, model_type=model_type, stage=1,
                                lr=stage_cfg.lr, gradient_clip_val=stage_cfg.gradient_clip_val,
                                use_gradient_loss=cfg.training.loss.use_gradient,
-                               gradient_weight=cfg.training.loss.gradient_weight)
+                               gradient_weight=cfg.training.loss.gradient_weight,
+                               use_cosine_scheduler=stage_cfg.get("use_cosine_scheduler", True),
+                               max_epochs=epochs_s1,
+                               obs_weight_lr_scale=stage_cfg.get("obs_weight_lr_scale", 1.0),
+                               prior_unet_lr_scale=stage_cfg.get("prior_unet_lr_scale", 1.0),
+                               **psc_teacher_options(cfg))
                 trainer = create_trainer(cfg, 1)
-                trainer.fit(lit, loaders["train"], loaders["val"])
+                init_from = stage_cfg.get("init_from", None)
+                if init_from and resume_ckpt_path(1) is None:
+                    load_init_weights(lit.model, init_from)
+                    print(f"Stage 1 initialised from {init_from} (fine-tuning)")
+                trainer.fit(lit, loaders["train"], loaders["val"], ckpt_path=resume_ckpt_path(1))
                 path = cfg.paths.checkpoint_stage1
                 torch.save(lit.model.state_dict(), path)
             train_time += time.time() - t0
@@ -225,6 +967,36 @@ def main(cfg: DictConfig):
             model = train_stage(model, loaders, cfg, stage=2, device=device)
             train_time += time.time() - t0
             print(f"    Stage 2 done in {time.time()-t0:.1f}s")
+        elif model_type == "tweedie_cfm" and epochs_s2 > 0:
+            t0 = time.time()
+            stage_cfg = cfg.training.stage2
+            lit = LitModel(model, model_type=model_type, stage=2,
+                           lr=stage_cfg.lr, gradient_clip_val=stage_cfg.gradient_clip_val,
+                           use_gradient_loss=cfg.training.loss.use_gradient,
+                           gradient_weight=cfg.training.loss.gradient_weight,
+                           use_cosine_scheduler=stage_cfg.get("use_cosine_scheduler", True),
+                           max_epochs=epochs_s2)
+            trainer = create_trainer(cfg, 2)
+            trainer.fit(lit, loaders["train"], loaders["val"], ckpt_path=resume_ckpt_path(2))
+            path = cfg.paths.checkpoint_stage2
+            torch.save(lit.model.state_dict(), path)
+            train_time += time.time() - t0
+            print(f"    Stage 2 done in {train_time-t0:.1f}s")
+        elif model_type in ("joint_cfm", "joint_cfm_coupled", "joint_direct_unet") and epochs_s2 > 0:
+            t0 = time.time()
+            stage_cfg = cfg.training.stage2
+            lit = LitModel(model, model_type=model_type, stage=2,
+                           lr=stage_cfg.lr, gradient_clip_val=stage_cfg.gradient_clip_val,
+                           use_gradient_loss=cfg.training.loss.use_gradient,
+                           gradient_weight=cfg.training.loss.gradient_weight,
+                           use_cosine_scheduler=stage_cfg.get("use_cosine_scheduler", True),
+                           max_epochs=epochs_s2)
+            trainer = create_trainer(cfg, 2)
+            trainer.fit(lit, loaders["train"], loaders["val"], ckpt_path=resume_ckpt_path(2))
+            path = cfg.paths.checkpoint_stage2
+            torch.save(lit.model.state_dict(), path)
+            train_time += time.time() - t0
+            print(f"    Stage 2 done in {train_time-t0:.1f}s")
     finally:
         os.chdir(orig_cwd)
     total_t = time.time() - total_t0
@@ -233,11 +1005,36 @@ def main(cfg: DictConfig):
     model.to(device)
     model.eval()
     t0 = time.time()
-    test_keys = ["test_cs1", "test_cs2", "test_cs3", "test_cs4"]
     results_metrics = {}
+    param_metrics = {}
+    is_joint = model_type in ("joint_cfm", "joint_cfm_coupled", "joint_direct_unet", "param_head", "param_head_unet")
+    NO = dc.get("NO", 8)
+    J = dc.get("J", 4)
+    obs_j_local = dc.get("obs_j", 2)
+    # subgrad+state+trueprior (full_state_target=True) needs the window's true
+    # forcing/params at eval time too -- model.sample() differentiates through
+    # the actual L96 ODE, which requires them regardless of param_dim (see
+    # _make_eval_batch).
+    eval_with_true_forcing = dc.get("with_true_forcing", False)
     for key in test_keys:
-        if key in datasets:
-            m, s = evaluate_model(model, datasets[key], device, model_type)
+        if key not in datasets:
+            continue
+        if is_joint:
+            m, s, prmse = evaluate_model(model, datasets[key], device, model_type,
+                                         return_params=True, param_names=param_names,
+                                         param_dim=param_dim, obs_var_indices=obs_var_indices,
+                                         use_biased_params=(model_type in ("param_head", "param_head_unet")),
+                                         with_true_forcing=eval_with_true_forcing,
+                                         norm_stats=eval_norm_stats)
+            results_metrics[key] = (m, s)
+            param_metrics[key] = prmse
+        else:
+            m, s = evaluate_model(model, datasets[key], device, model_type,
+                                  param_names=param_names, param_dim=param_dim,
+                                  obs_var_indices=obs_var_indices,
+                                  use_biased_params=(model_type in ("param_head", "param_head_unet")),
+                                  with_true_forcing=eval_with_true_forcing,
+                                  norm_stats=eval_norm_stats)
             results_metrics[key] = (m, s)
     eval_t = time.time() - t0
 
@@ -246,36 +1043,61 @@ def main(cfg: DictConfig):
         if key in datasets:
             case = key.replace("test_", "")
             save_trajectories(model, datasets[key], device, model_type,
-                              os.path.join(exp_dir, f"trajectories_{case}.npz"))
+                              os.path.join(exp_dir, f"trajectories_{case}.npz"),
+                              param_names=param_names, param_dim=param_dim,
+                              obs_var_indices=obs_var_indices,
+                              use_biased_params=(model_type in ("param_head", "param_head_unet")),
+                              with_true_forcing=eval_with_true_forcing,
+                              norm_stats=eval_norm_stats)
+
+    state_names = cfg.data.get("state_names", ["X", "Y", "Z"])
 
     def _rmse_entry(m, s):
-        return {
-            "X": {"mean": float(m[0]), "std": float(s[0])},
-            "Y": {"mean": float(m[1]), "std": float(s[1])},
-            "Z": {"mean": float(m[2]), "std": float(s[2])},
-            "mean": float(np.mean(m)),
-        }
+        d = {"mean": float(np.mean(m))}
+        for i, nm in enumerate(state_names):
+            d[nm] = {"mean": float(m[i]), "std": float(s[i])}
+        if obs_var_indices is not None:
+            d["groups"] = _per_group_rmse(m, obs_var_indices, NO=NO, J=J, obs_j=obs_j_local)
+        return d
 
+    def _param_entry(p):
+        return {nm: float(p[i]) for i, nm in enumerate(param_names)}
+
+    s0 = results_metrics.get("test_s0")
+    s1 = results_metrics.get("test_s1")
     cs1 = results_metrics.get("test_cs1")
     cs2 = results_metrics.get("test_cs2")
     cs3 = results_metrics.get("test_cs3")
     cs4 = results_metrics.get("test_cs4")
 
+    hc_src = (cfg.model.direct_unet if model_type in ("direct_unet", "joint_direct_unet")
+              else cfg.model.get("monai_direct_unet") if model_type == "monai_direct_unet"
+              else cfg.model.get("monai_direct_unet_2d") if model_type == "monai_direct_unet_2d"
+              else cfg.model.get("vanilla_cfm") if model_type in ("vanilla_cfm", "joint_cfm", "joint_cfm_coupled")
+              else cfg.model.get("monai_vanilla_cfm") if model_type == "monai_vanilla_cfm"
+              else cfg.model.get("sda_prior") if model_type in ("sda_prior", "sda_prior_cond")
+              else cfg.model.get("monai_sda_prior") if model_type in ("monai_sda_prior", "monai_sda_prior_cond")
+              else cfg.model.get("fdv") if model_type == "fourdvarnet"
+              else cfg.model.get("fdv_cfm") if model_type == "fourdvarnet_cfm"
+              else cfg.model)
     result = {
         "experiment_id": exp_id,
         "model_type": model_type,
         "config": {
-            "hidden_channels": list(cfg.model.direct_unet.hidden_channels if model_type == "direct_unet"
-                                      else cfg.model.vanilla_cfm.hidden_channels if model_type == "vanilla_cfm"
-                                      else cfg.model.hidden_channels),
-            "epochs": epochs_s1 + (epochs_s2 if model_type == "tweedie" else 0),
+            "hidden_channels": list(hc_src.hidden_channels) if hc_src is not None and "hidden_channels" in hc_src else list(cfg.model.hidden_channels),
+            "epochs": epochs_s1 + (epochs_s2 if model_type in ("tweedie", "tweedie_cfm") else 0),
             "train_mix": train_mix,
             "randomize_params": randomize_params,
+            "data_setup": data_setup,
         },
         "total_time_seconds": total_t,
         "train_time_seconds": train_time,
         "eval_time_seconds": eval_t,
     }
+    if s0:
+        result["fm_s0"] = _rmse_entry(*s0)
+    if s1:
+        result["fm_s1"] = _rmse_entry(*s1)
     if cs1:
         result["fm_cs1"] = _rmse_entry(*cs1)
     if cs2:
@@ -284,27 +1106,50 @@ def main(cfg: DictConfig):
         result["fm_cs3"] = _rmse_entry(*cs3)
     if cs4:
         result["fm_cs4"] = _rmse_entry(*cs4)
+    if s0 and s1:
+        result["fm_degradation"] = float(np.mean(s1[0]) / (np.mean(s0[0]) + 1e-10))
     if cs1 and cs2:
-        result["fm_degradation"] = float(np.mean(cs2[0]) / (np.mean(cs1[0]) + 1e-10))
+        result["fm_degradation_cs1cs2"] = float(np.mean(cs2[0]) / (np.mean(cs1[0]) + 1e-10))
     if cs3 and cs4:
         result["fm_degradation_cs3cs4"] = float(np.mean(cs4[0]) / (np.mean(cs3[0]) + 1e-10))
+    if is_joint:
+        if "test_s0" in param_metrics:
+            result["param_rmse_s0"] = _param_entry(param_metrics["test_s0"])
+        if "test_s1" in param_metrics:
+            result["param_rmse_s1"] = _param_entry(param_metrics["test_s1"])
 
     with open(results_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\n  ── Results ─────────────────────────────────")
+    def _fmt_rmse(m):
+        parts = [f"{nm}={m[i]:.4f}" for i, nm in enumerate(state_names)]
+        return " ".join(parts) + f"  mean={np.mean(m):.4f}"
+
+    print("\n  ── Results ─────────────────────────────────")
+    if s0:
+        m0, _ = s0
+        groups0 = _per_group_rmse(m0, obs_var_indices, NO=NO, J=J, obs_j=obs_j_local) if obs_var_indices else {}
+        print(f"  S0: {_fmt_rmse(m0)}")
+        if groups0:
+            print(f"       slow={groups0['slow']:.4f}  obs_fast={groups0['obs_fast']:.4f}  all_obs={groups0['all_obs']:.4f}")
+    if s1:
+        m1, _ = s1
+        groups1 = _per_group_rmse(m1, obs_var_indices, NO=NO, J=J, obs_j=obs_j_local) if obs_var_indices else {}
+        print(f"  S1: {_fmt_rmse(m1)}")
+        if groups1:
+            print(f"       slow={groups1['slow']:.4f}  obs_fast={groups1['obs_fast']:.4f}  all_obs={groups1['all_obs']:.4f}")
     if cs1:
         m1, s1 = cs1
-        print(f"  CS1: X={m1[0]:.4f} Y={m1[1]:.4f} Z={m1[2]:.4f}  mean={np.mean(m1):.4f}")
+        print(f"  CS1: {_fmt_rmse(m1)}")
     if cs2:
         m2, s2 = cs2
-        print(f"  CS2: X={m2[0]:.4f} Y={m2[1]:.4f} Z={m2[2]:.4f}  mean={np.mean(m2):.4f}")
-    if cs3:
-        m3, s3 = cs3
-        print(f"  CS3: X={m3[0]:.4f} Y={m3[1]:.4f} Z={m3[2]:.4f}  mean={np.mean(m3):.4f}")
-    if cs4:
-        m4, s4 = cs4
-        print(f"  CS4: X={m4[0]:.4f} Y={m4[1]:.4f} Z={m4[2]:.4f}  mean={np.mean(m4):.4f}")
+        print(f"  CS2: {_fmt_rmse(m2)}")
+    if is_joint:
+        for k in ["test_s0", "test_s1"]:
+            if k in param_metrics:
+                p = param_metrics[k]
+                parts = " ".join(f"{nm}={p[i]:.4f}" for i, nm in enumerate(param_names))
+                print(f"  {k} param RMSE: {parts}")
     print(f"  Total: {total_t:.0f}s")
 
 

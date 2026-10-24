@@ -1,0 +1,561 @@
+\section{Results}
+\label{sec:results}
+
+\subsection{Overview: the two symptoms across three systems}
+\label{sec:overview}
+
+We begin with the headline, in two parts. The first is an \emph{intra-classical}
+statement and needs no cross-class comparison: each scheme is its own control,
+and no objection about the tuning of one family against another applies to it.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+\textbf{system} & \textbf{metric} & \textbf{Strong-4D-Var} & \textbf{Weak-4D-Var} & \textbf{EnKF} & \textbf{ETKF} \\
+\midrule
+L63 & RMSE $\Sz\!\to\!\So$ & $0.767 \to 2.100$ & $0.642 \to 1.633$ & $0.881 \to 2.267$ & $0.878 \to 2.271$ \\
+    & \emph{degradation}   & $2.74\times$ & $2.54\times$ & $2.57\times$ & $2.59\times$ \\
+\addlinespace
+L96 & RMSE $\Sz\!\to\!\So$ & $0.703 \to 1.436$ & \emph{not run} & $0.711 \to 1.514$ & $0.687 \to 1.478$ \\
+    & \emph{degradation}   & $2.04\times$ & --- & $2.13\times$ & $\mathbf{2.15\times}$ \\
+\addlinespace
+QG  & $\psi$ EV $\Sz\!\to\!\So$ & $0.9714 \to 0.9314$ & $0.9660 \to 0.9468$ & $0.9584 \to 0.9410$ & $0.9593 \to 0.9424$ \\
+    & $q$ EV $\Sz\!\to\!\So$ & $\mathbf{-0.126 \to -0.857}$ & $-0.034 \to -0.501$ & $0.500 \to 0.413$ & $0.498 \to 0.412$ \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Classical DA is not robust to model error, on all three
+systems.} Each scheme is compared against itself, so no cross-class caveat
+applies. Note the QG potential-vorticity row: both variational schemes are
+\emph{negative} at \Sz{} --- worse than predicting the climatological mean ---
+and Strong-4D-Var reaches $-0.857$ under model error, while the ensemble filters
+hold near $0.4$. The L96 DA forward model receives each window's fast-variable
+weights, and ETKF/EnKF use inflation 1.5 at \Sz{} and 2.0 at \So{} (earlier drafts
+omitted the weights, so their \Sz{} was not perfect-model; Section~\ref{sec:protocol}).
+Sources: \texttt{reports/l63/outputs/s0\_s1\_synthesis.md},
+\texttt{reports/l96/outputs/l96\_benchmark\_extended.md},
+\texttt{reports/qg/outputs/qg\_neural\_report.md}.}
+\label{tab:overview-robust}
+\end{table}
+
+The second part compares across classes, and therefore carries the caveat of
+Table~\ref{tab:classes}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{system} & \textbf{metric} & \textbf{best classical} $\Sz$ / $\So$ & \textbf{best learned} $\Sz$ / $\So$ \\
+\midrule
+L96 & RMSE ($\downarrow$) & $0.687$ \emph{(ETKF)} / $1.436$ \emph{(Strong-4D-Var)} & $\mathbf{0.310}$ \emph{(DirectUNet-M$\to$SDA2)} / $\mathbf{0.307}$ \emph{(DirectUNet-M$\to$SDA3-fix)} \\
+QG  & $\psi$ EV ($\uparrow$) & $0.9714$ / $0.9468$ & $\mathbf{0.9827}$ / $\mathbf{0.9808}$ \emph{(Q2 / Q4)} \\
+QG  & $q$ EV ($\uparrow$) & $0.500$ / $0.413$ \emph{(EnKF)} & $\mathbf{0.6745}$ / $\mathbf{0.6744}$ \emph{(Q4)} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Learned schemes outperform at \Sz{} and, unlike the classical
+family, hold under \So{}.} \emph{L63 is absent by necessity: it carries no
+learned schemes} (Table~\ref{tab:coverage}), so the robustness statement above
+spans three systems while this one spans two. The near-invariance of the learned
+columns must be read through Table~\ref{tab:classes} --- for a model-free scheme
+it is definitional, for a conditioned one it is a result. The L96 learned entries are
+conditioned (their SDA priors receive the biased DA parameters at \So{}), so their
+\So{} values are a result; Section~\ref{sec:inert} separates the two cases. The
+best \Sz{} and \So{} schemes differ: the SDA2 hybrid degrades to $0.333$ at \So{},
+the SDA3-fix hybrid is $0.312$ at \Sz{}. L96: regular 30-observation test grid,
+benchmark-default training (Section~\ref{sec:protocol}); the SDA priors are
+trained for 400 epochs, not 1200.}
+\label{tab:overview-gap}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lrrrcc@{}}
+\toprule
+\textbf{scheme} & \textbf{\Sz{}} & \textbf{\So{}} & $\So/\Sz$ & \textbf{slots} & \textbf{spread/RMSE} \\
+\midrule
+Strong-4D-Var & 0.703 & 1.436 & \textbf{2.04} & $\Psimean$ & --- \\
+ETKF          & 0.687 & 1.478 & \textbf{2.15} & $\Psimean + \PsiG$ & $0.98$ \\
+EnKF          & 0.711 & 1.514 & \textbf{2.13} & $\Psimean + \PsiG$ & $0.97$ \\
+\addlinespace
+SDA1-M        & 0.501 & 0.500 & 1.00 & all three & $0.42$ \\
+DirectUNet-M  & 0.340 & 0.339 & 1.00 & $\Psimean$ & --- \\
+PredictStateCFM-M & 0.341 & 0.338 & 0.99 & all three & $0.63$ \\
+VanillaCFM-M  & 0.351 & 0.349 & 0.99 & all three & $0.71$ \\
+DirectUNet-M$\to$SDA3-fix-M & \textbf{0.312} & 0.307 & 0.98 & all three & $0.53$ \\
+\bottomrule
+\end{tabular}
+\caption{Lorenz-96 under the benchmark default (Section~\ref{sec:protocol}):
+random observing system in training, 1200 epochs, 3 seeds, M tier throughout ---
+except the SDA priors (SDA1-M, and the prior of the hybrid), which are trained for
+400 epochs and never see observations in training;
+regular 30-observation test grid; mean over windows of the per-window RMSE.
+DA spread from the analysis ensemble; DirectUNet is a single forward pass and has
+no spread. The lower block's $\So/\Sz$ is definitional for the model-free rows
+(Table~\ref{tab:classes}); the hybrid's prior is conditioned on the biased DA
+parameters, so its ratio is a result. Source:
+\texttt{reports/l96/outputs/l96\_benchmark\_extended.md}.}
+\label{tab:price}
+\end{table}
+
+\textbf{Occupying more operator slots does not by itself buy accuracy.}
+DirectUNet fills $\Psimean$ alone and matches the conditional flows, which fill all
+three (0.340 against 0.341--0.351), at equal training budget. SDA1 also fills all
+three and is the weakest learned scheme in the table (0.501), but that comparison
+is not budget-matched --- its prior had 400 epochs against 1200
+(Section~\ref{sec:protocol}), and the other families gained $9$--$19\%$ from the
+extra budget --- so it is a pessimistic estimate of SDA's accuracy, not a ranking. The most accurate scheme combines the two:
+DirectUNet supplies the mean and a conditioned SDA prior the rest (0.312). The
+slots determine what a scheme \emph{can represent}, not how well it estimates ---
+and Section~\ref{sec:nongaussian} shows the same non-monotonicity in the
+dispersion column, in the opposite direction.
+\caveat{The learned ranking depends on the training budget and protocol. At 400
+epochs DirectUNet led (0.380 against 0.403--0.430); at 1200 the three families
+are within 3\%. Under the P1 protocol --- one fixed observation grid, observation
+noise frozen per window --- the flows led (0.341--0.354 against 0.470), because
+DirectUNet overfit the frozen noise. No ranking should be quoted without the
+budget and the protocol.}
+
+Two observations set up everything that follows. First, the degradation is not a
+uniform error floor: it varies from $2.0\times$ to $2.7\times$ across systems
+and, on QG's potential-vorticity field, turns a positive skill score negative.
+Second, the schemes that do not degrade are precisely those whose prior is not an
+integrated model. The rest of this section asks \emph{why}, and attributes each
+part of the answer to a named hypothesis.
+
+\subsection{Conditioning on model information: inert at \texorpdfstring{\Sz{}}{S0}, decisive under \texorpdfstring{\So{}}{S1}}
+\label{sec:inert}
+
+If the learned schemes are robust to \So{}, the obvious question is whether they
+use $\thv^{*}$ at all --- and, for the schemes that do, whether being handed the
+biased parameters hurts them.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+\textbf{scheme} & \textbf{conditioning in training} & \textbf{\Sz{}} & \textbf{\So{}} & $\So/\Sz$ \\
+\midrule
+SDA1-M & none (unconditional prior) & 0.501 & 0.500 & 1.00 \\
+SDA2-M & $(\thv,\zv^{*})$, DA parameters $=$ truth & 0.500 & 0.509 & \textbf{1.02} \\
+SDA3-fix-M & $(\thv^{*},\zv^{*})$, noisy DA parameters & 0.501 & 0.501 & 1.00 \\
+\addlinespace
+DirectUNet-M$\to$SDA2-M & as SDA2 & \textbf{0.310} & 0.333 & \textbf{1.07} \\
+DirectUNet-M$\to$SDA3-fix-M & as SDA3-fix & 0.312 & \textbf{0.307} & 0.98 \\
+\bottomrule
+\end{tabular}
+\caption{Lorenz-96 conditioning ladder, benchmark default, M tier, 3 seeds (SDA
+priors trained for 400 epochs, Section~\ref{sec:protocol}),
+regular 30-observation test grid, guidance weight 25 (validation-tuned). At \So{}
+the conditioned priors receive the biased DA parameters and the corrupted forcing
+--- the same model the DA baselines assimilate with. Hybrids: the 1200-epoch
+DirectUNet-M supplies the mean, $\tau_0 = 0.1$, guidance weight 2
+(validation-tuned). \textbf{A prior trained on the true parameters degrades when
+handed biased ones; one trained on noisy parameters does not.} Source:
+\texttt{reports/l96/outputs/l96\_benchmark\_extended.md}.}
+\label{tab:ladder}
+\end{table}
+
+At \Sz{}, conditioning on model information moves skill by less than seed noise:
+SDA1, SDA2 and SDA3-fix are within $0.001$ of each other. Under \So{} it
+separates them. SDA2, trained with its conditioning parameters equal to the
+truth, degrades by $2\%$ when handed the biased DA parameters, in every seed and
+at every guidance weight tried (weights 15--40 on the validation windows:
+$1.7$--$1.9\%$ on the regular grid, $2.5$--$3.0\%$ on random layouts). SDA3-fix, trained on noisy
+DA parameters, degrades \emph{no more than the unconditional prior}: on the
+regular grid at the tuned weight it is flat ($0.501 \to 0.501$), and on the random
+observing system it loses $1.5\%$ against SDA1's $2.0\%$ and SDA2's $3.6\%$. The
+robust statement is the comparison with SDA1, not the flat ratio: SDA3-fix's own
+\So/\Sz{} ratio moves with the guidance weight ($1.014$ at 15, $0.985$ at 40 on the
+regular validation windows) while SDA2's does not. Alone the gap is small ---
+comparable to the spread across SDA3-fix seeds ($0.494$--$0.514$) --- but as the
+prior of the best scheme it decides robustness: the SDA2 hybrid degrades by $7\%$
+under \So{}, the SDA3-fix hybrid not at all ($0.312 \to 0.307$), which makes it the
+most accurate scheme at \So{} on both test sets.
+
+\caveat{That the SDA3-fix hybrid is slightly \emph{better} at \So{} than at \Sz{}
+should not be read as a gain from model error. Its training conditioning is the
+truth plus a fraction of the DA bias drawn uniformly on $[0, 1.5]$, per parameter.
+\Sz{} conditions it at fraction 0, the edge of that range; \So{} at fraction 1,
+inside it. The same drift appears for SDA3-fix alone at high guidance weight.}
+
+\caveat{Two earlier readings of this ladder were artefacts. The P1 SDA3
+configuration never activated its noisy-bias conditioning --- its training DA
+parameters equalled the truth, so it trained identically to SDA2 --- and every
+\So{} evaluation of the conditioned priors made before 2026-09-25 fed them the
+\emph{true} parameters. Both are corrected here; the earlier draft's conclusion
+that conditioning is inert does not survive.}
+
+This sharpens the thesis rather than contradicting it. A learned estimator is
+robust to corrupted model information \emph{if it was trained to expect it}: a
+prior conditioned on the truth during training acquires a dependence on the
+parameters that the biased ones then exploit, while one trained on noisy
+parameters learns how far to trust them and leans on the observations instead.
+Classical DA has no such option --- its prior is the integrated model. H2 binds
+not because model information is unhelpful, but because DA cannot learn how much
+to trust it.
+
+\paragraph{The training-exposure control has not been run on the corrected
+protocol.}
+The one available run --- an SDA2 prior trained with zero forcing/state bias,
+the only configuration never exposed to \So{}-level error in training (\Sz{} 0.7046
+/ \So{} 0.7033) --- is not usable: it predates the 2026-09-25 fix, so its \So{}
+evaluation fed the prior the true parameters, and it uses an earlier backbone
+($\sim$0.70 against $\sim$0.50 for the M tier here). The ladder already answers
+most of what it was meant to: a prior conditioned on the truth in training is the
+fragile one.
+\needsrun{SDA2-nominal-M (no forcing/state bias in training), three seeds,
+evaluated with the biased \So{} conditioning.}
+
+\paragraph{QG separates the definitional case from the real one.}
+The QG DirectUNet ladder makes Table~\ref{tab:classes}'s caveat concrete. Q1 is
+obs-only, so its \So{} numbers are \emph{bit-identical} to its \Sz{} numbers
+($\psi$ EV 0.9805 both) --- definitional, and carrying no robustness
+information. Q2 is oracle-conditioned and is the best scheme at \Sz{} (0.9827)
+but falls to 0.9490 under \So{}. Q3 and Q4, conditioned on \emph{noisy} model
+information, hold (0.9798 $\to$ 0.9763; 0.9824 $\to$ 0.9808). Conditioning on
+\emph{true} model information is again the fragile choice, exactly as for SDA2 on
+L96.
+
+\paragraph{Consequence: ODE sensitivity is not posterior sensitivity.}
+\label{sec:sensitivity}
+Two distinct sensitivities are in play, and classical DA cannot separate them:
+the \emph{model} sensitivity $\partial \xv_{\mathrm{ODE}}/\partial(\thv,\zv)$ of
+the free-running trajectory, Lyapunov-amplified and large; and the
+\emph{posterior} sensitivity $\partial\, p(\xv_1\mid\Cv)/\partial(\thv,\zv)$ at
+fixed $\yv$. Classical DA conflates them \textbf{by construction}, because its
+estimator \emph{is} the model: by~\eqref{eq:ssm} every route from $(\thv,\zv)$ to
+the analysis passes through $\Phi$. Its \Sz{}$\to$\So{} degradation therefore
+measures \emph{its own estimator's} sensitivity, and cannot be read as a
+measurement of how much $(\thv,\zv)$ uncertainty matters for the posterior.
+
+The ladder above measures the other quantity directly: a conditioned amortised
+estimator takes $(\thv^{*},\zv^{*})$ as inputs at fixed $\yv$, so perturbing the
+conditioning while holding the observations fixed is a finite-difference estimate
+of posterior sensitivity. Replacing the true by the biased parameters at fixed
+$\yv$ moves skill by $2$--$4\%$ for a prior trained on the truth and by no more
+than for the unconditional prior ($0$--$1.5\%$) for one trained on noisy
+parameters, against the $2.0$--$2.2\times$ by which the classical schemes degrade
+over the same perturbation.
+
+\textbf{Assessing parameter and forcing uncertainty by propagating it through the
+model therefore overstates its effect on the posterior whenever the observations
+are informative}, and the overstatement is exactly the gap between the two
+sensitivities. This is an inference from the two measurements above rather than a
+separate experiment; a direct measurement would sweep both sensitivities over one
+grid of observation density $\times$ perturbation amplitude, and would also test
+the prediction that posterior sensitivity \emph{grows} as observations sparsify,
+since less of $(\thv,\zv)$ is then screened off by $\yv$.
+\needsrun{Both sensitivities on one density $\times$ amplitude grid. The
+crossover density would be the paper's second headline number.}
+
+\subsection{Model error destroys the marginal value of observations}
+\label{sec:marginal}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{method} & \textbf{\Sz{}: gain from $2\times$ obs} & \textbf{\So{}: same gain} & \textbf{collapse} \\
+\midrule
+Strong-4D-Var & $0.930 \to 0.738$ (\textbf{20.6\%}) & $1.479 \to 1.431$ (\textbf{3.2\%}) & $\mathbf{6.4\times}$ \\
+ETKF          & $0.943 \to 0.831$ (11.9\%)          & $1.653 \to 1.471$ (11.0\%)         & $1.1\times$ \\
+EnKF          & $0.950 \to 0.849$ (10.6\%)          & $1.673 \to 1.508$ (9.9\%)          & $1.1\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Lorenz-96, \emph{temporal} observation density doubled (15 $\to$ 30
+observations per window). A separate configuration from Table~\ref{tab:price}
+--- all five parameters randomised $\pm 20\%$, inflation 2.0 --- so the two must
+not be cross-quoted. The DA forward model receives each window's fast-variable
+weights; earlier drafts omitted them, which left \Sz{} mis-specified and inflated
+the filters' ratio to $1.9\times$. On the benchmark data at the per-case
+inflation (1.5 at \Sz{}, 2.0 at \So{}) the ratios are $7.0\times$ for
+Strong-4D-Var and $1.6$--$1.7\times$ for the filters. Source:
+\texttt{reports/l96/outputs/l96\_benchmark\_extended.md}, section 7.}
+\label{tab:marginal}
+\end{table}
+
+Under model error, doubling the observations buys strong-constraint 4D-Var
+3.2\%, against 20.6\% with the correct model. The ensemble filters keep most of
+their marginal value (ETKF 11.0\% against 11.9\%): the collapse is specific to the
+strong-constraint variational method, whose analysis is constrained to a single
+trajectory of the wrong model.
+
+\textbf{For strong-constraint 4D-Var, H2 does not merely set an error floor; it
+decouples the analysis from the observations.} A method whose analysis is a wrong
+model's trajectory cannot be rescued by more data --- exactly the regime of
+sparse-observation geophysical DA. This is also
+H3b's shadow: at low density DA has nothing but the model, so model error and
+observation sparsity \emph{compound rather than add}.
+
+That compounding is the more general pattern, and it recurs on the other
+structural axis: Section~\ref{sec:representation} shows model error and the
+choice of state representation compounding in the same way, the cost of a
+representation swap growing by an order of magnitude between \Sz{} and \So{}.
+Model error is not one deficit among four --- it is the multiplier on the
+others.
+
+\paragraph{Weak-constraint 4D-Var bounds this claim.}
+\label{sec:weak4dvar}
+Weak-constraint 4D-Var frees a per-step model-error term and is therefore the one
+classical scheme \emph{permitted} to know the model is wrong --- the honest
+ceiling for the family. It has been run on two of the three systems, and on both
+it is the strongest classical scheme under model error: on L63 it beats
+strong-constraint by 22\% at \So{} (1.633 against 2.100), and on QG it leads on
+both fields at \So{} ($\psi$ 0.9468 against 0.9314; $q$ $-0.501$ against
+$-0.857$). The gap in Table~\ref{tab:overview-gap} is therefore not an artefact
+of comparing against a strawman: the classical family is represented by its best
+member.
+
+It also bounds what may be claimed here. \textbf{The collapse in
+Table~\ref{tab:marginal} is established for strong-constraint 4D-Var only} ---
+the filters keep most of their marginal value; weak-constraint 4D-Var is the
+formulation that explicitly relaxes
+H2, and the corresponding measurement on the density grid does not exist --- L96
+is the one system where it has not been run at all.
+\needsrun{Weak-constraint 4D-Var on Lorenz-96 across the observation-density
+grid. The implementation exists; the benchmark run does not. Single
+highest-value outstanding experiment, because it is the only one that can widen
+or narrow the paper's headline claim.}
+
+\subsection{The representation decides which fields are reconstructed, and model
+error widens the trade}
+\label{sec:representation}
+
+The cleanest manipulation available in this study. The QG \texttt{psi\_state}
+variant integrates the \emph{same} dynamics with the streamfunction as the state
+variable instead of potential vorticity. The $q$-space physics is bit-identical
+--- free forecasts agree to $\sim 10^{-6}$ relative --- so nothing changes except
+which variable is called ``the state'', and with it the observation operator,
+which becomes a trivial index lookup.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+\textbf{scenario} & \textbf{state variable} & \textbf{$\psi$ EV} & \textbf{$q$ EV} & \textbf{$q$ layer 2} \\
+\midrule
+\multirow{2}{*}{\Sz{} (error-free)} & $q$-state (default) & $+0.968$ & $\mathbf{+0.752}$ & $+0.688$ \\
+                                    & $\psi$-state        & $\mathbf{+0.977}$ & $+0.583$ & $+0.403$ \\
+\addlinespace
+\multirow{2}{*}{\So{} (model error)} & $q$-state (default) & $+0.328$ & $\mathbf{+0.428}$ & $+0.304$ \\
+                                     & $\psi$-state        & $\mathbf{+0.606}$ & $\mathbf{-2.925}$ & $\mathbf{-4.664}$ \\
+\bottomrule
+\end{tabular}
+\caption{QG, explained variance, identical physics in two state variables.
+Swapping to $\psi$-state \emph{improves} the streamfunction analysis and
+\emph{degrades} the potential-vorticity analysis --- and \textbf{model error
+widens the trade by an order of magnitude}. Source:
+\texttt{reports/qg/outputs/qg\_psi\_state\_report.md}.}
+\label{tab:representation}
+\end{table}
+
+The mechanism is the map between the two representations: $q \approx \nabla^2\psi$
+amplifies high-wavenumber $\psi$-analysis error by $K^2$, so a scheme that fits
+$\psi$ well can be arbitrarily bad in $q$ while remaining, by its own metric,
+excellent.
+
+\textbf{The size of the trade is the result, not its sign.} At \Sz{} the swap
+buys $+0.009$ on $\psi$ and costs $-0.169$ on $q$. At \So{} it buys $+0.278$ and
+costs $-3.353$. The representation choice is nearly free when the model is
+correct and catastrophic when it is not, which places this result on the paper's
+main axis rather than beside it: H3a and H2 are not independent, because the
+error the representation amplifies is exactly the error model discrepancy
+creates.
+
+\paragraph{The same effect across the classical schemes.}
+This is not confined to a single controlled swap. In
+Table~\ref{tab:overview-robust} the variational schemes --- which optimise a
+$\psi$-observation cost --- carry \emph{negative} $q$ scores at \Sz{}
+($-0.126$, $-0.034$) falling to $-0.857$ and $-0.501$ at \So{}, while the
+ensemble filters, updating in $q$, hold near $+0.4$. The learned schemes, trained
+to reconstruct the target field directly rather than inheriting it through an
+inversion, are best of all on $q$ ($0.60$--$0.67$). Which field a scheme
+reconstructs well tracks the representation it works in, not how much information
+the observations carry --- the observations are identical across every row.
+
+\paragraph{What is missing: the same manipulation on the learned side.}
+The controlled evidence here is all on the DA side, where the state variable is
+an explicit modelling choice. The learned schemes have a representation too ---
+the space their inputs and outputs are expressed in --- but no equivalent
+controlled swap has been run.
+\caveat{An existing L96 per-channel normalisation ablation reports that
+retraining in a normalised space \emph{degrades} skill substantially (explained
+variance $0.857 \to 0.027$). That result is not used here: it was measured on a
+different backbone from the schemes in this paper, whose best configurations
+\emph{do} normalise, so it cannot be reconciled without a matched rerun.}
+The experiment is well defined, because the existing QG network is already one
+arm of it. Its supervision target is the two-layer streamfunction, and $q$ is
+obtained by spectrally inverting the predicted $\psi$ --- structurally the same
+path as the DA $\psi$-state variant, and subject to the same $K^2$
+amplification. What is missing is the $q$-output arm. One complication makes the
+design a $2\times 2$ rather than a straight swap: the network carries an optional
+auxiliary $q$-loss (weight $1/\mathrm{Var}(q)$), which supervises the inverted
+field directly and so partially decouples \emph{output space} from \emph{what is
+supervised}. Both must be varied to attribute the effect to either.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+\textbf{scenario} & \textbf{output space} & \textbf{aux $q$-loss} & \textbf{$\psi$ EV} & \textbf{$q$ EV} & \textbf{$q$ layer 2} & \textbf{spread/skill} \\
+\midrule
+\multirow{4}{*}{\Sz{}}
+  & $\psi$ (existing) & \checkmark & $0.9805$ & $0.6238$ & \emph{pending} & \emph{pending} \\
+  & $\psi$            & ---        & \emph{pending} & \emph{pending} & \emph{pending} & \emph{pending} \\
+  & $q$               & n/a        & \emph{pending} & \emph{pending} & \emph{pending} & \emph{pending} \\
+  & $q$ $+$ aux $\psi$-loss & \checkmark & \emph{pending} & \emph{pending} & \emph{pending} & \emph{pending} \\
+\addlinespace
+\multirow{4}{*}{\So{}}
+  & $\psi$ (existing) & \checkmark & $0.9805$ & $0.6238$ & \emph{pending} & \emph{pending} \\
+  & $\psi$            & ---        & \emph{pending} & \emph{pending} & \emph{pending} & \emph{pending} \\
+  & $q$               & n/a        & \emph{pending} & \emph{pending} & \emph{pending} & \emph{pending} \\
+  & $q$ $+$ aux $\psi$-loss & \checkmark & \emph{pending} & \emph{pending} & \emph{pending} & \emph{pending} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Planned: the representation swap on the learned side}, matched
+to Table~\ref{tab:representation} --- same architecture, data, and training
+budget, with only the output space and the auxiliary loss varied. The two filled
+rows are the existing obs-only network (Q1); they are identical across scenarios
+\emph{by construction}, since that configuration receives no model information
+(Table~\ref{tab:classes}). \needsrun{Six cells' worth of training runs.}}
+\label{tab:representation-planned}
+\end{table}
+
+\textbf{The prediction, stated in advance.} If the effect is a property of
+inverse problems rather than of DA specifically, the $q$-output arm should beat
+the $\psi$-output arm on $q$ and lose to it on $\psi$, and the gap should widen
+between \Sz{} and \So{} as it does in Table~\ref{tab:representation}. If instead
+the auxiliary loss accounts for most of the difference --- that is, if
+$\psi$-output \emph{with} a $q$-loss matches $q$-output --- then the operative
+choice is what is \emph{supervised}, not what is \emph{represented}, and H3a is a
+weaker hypothesis than the DA result suggests. The existing numbers already hint
+at the second reading: the $\psi$-output network reaches $q$ EV $0.62$--$0.67$
+where the DA $\psi$-state variant collapses to $0.583$ and then $-2.925$, and the
+one structural difference between them is that $q$-loss.
+
+A spread/skill column is included because the swap should also be read against
+Section~\ref{sec:nongaussian}: if changing the output space moves calibration as
+well as accuracy, the representation is not separable from the dispersion
+question either.
+
+\subsection{Dispersion: the prediction from \texorpdfstring{$\PsiNG$}{Psi-NG} is
+not the one the data shows}
+\label{sec:nongaussian}
+
+Table~\ref{tab:zeroing} says the ensemble-Kalman class cannot represent $\PsiNG$
+at any tuning. The natural expectation is that this shows up as worse posterior
+characterisation. \textbf{Measured on spread/RMSE, the opposite is true.}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llcc@{}}
+\toprule
+\textbf{scheme} & \textbf{slots} & \textbf{\Sz{} RMSE} & \textbf{spread/RMSE} \\
+\midrule
+ETKF              & $\Psimean + \PsiG$ & 0.687 & $\mathbf{0.98}$ \\
+EnKF              & $\Psimean + \PsiG$ & 0.711 & $\mathbf{0.97}$ \\
+\addlinespace
+VanillaCFM-M      & all three & 0.351 & 0.71 \\
+PredictStateCFM-M & all three & 0.341 & 0.63 \\
+SDA1-M            & all three & 0.501 & 0.42 \\
+SDA2-M            & all three & 0.500 & 0.54 \\
+DirectUNet-M$\to$SDA3-fix-M & all three & $\mathbf{0.312}$ & 0.53 \\
+\bottomrule
+\end{tabular}
+\caption{Lorenz-96, \Sz{}, benchmark default, regular grid, M tier; DA spread
+from the analysis ensemble. Reliability target for $N=30$ is
+$\sqrt{(N-1)/(N+1)} = 0.967$. \textbf{The two classes fail in opposite
+directions}: the ensemble filters are within $3\%$ of the target; every scheme
+carrying a full non-Gaussian branch is \emph{under}-dispersed --- by $1.4\times$
+to $2.3\times$ relative to the target. Flows are sampled with 30 members and 20
+early-fine Euler steps. Source:
+\texttt{reports/l96/outputs/l96\_benchmark\_extended.md}.}
+\label{tab:calibration}
+\end{table}
+
+The accuracy/dispersion trade is real and stark --- the best-calibrated schemes
+are the least accurate and vice versa, with no scheme good at both --- but it
+does not run in the direction the operator partition suggests. The class that
+zeroes $\PsiNG$ is the better-calibrated one.
+
+\paragraph{What this does and does not license.}
+It does not rescue the ensemble-Kalman class: at \Sz{} it is $2.0\times$ less
+accurate than a conditional flow, and under model error it degrades by
+$2.1\times$ while the flows do not
+(Table~\ref{tab:overview-robust}). What it does is refute a specific inference
+--- that a missing $\PsiNG$ must show up as a dispersion deficit.
+
+The reconciliation is that \textbf{spread/RMSE is a second-moment diagnostic, and
+$\PsiNG$ is not a second-moment object.} A Gaussian update can match the
+posterior's spread exactly and still be wrong about its \emph{shape}: skewness,
+tail weight, multimodality. Nothing in Table~\ref{tab:calibration} can see that.
+The rank histogram can: it tests the full predictive distribution rather than its
+variance. Measured for every class at $N=30$ on the regular grid, \textbf{it does
+not single out the ensemble-Kalman class either.} Most of the filters' apparent
+shape defect is a \emph{mean} bias, the forward-model error their \Sz{} runs
+carried; once spread and per-channel bias are corrected, their residual shape
+error (reliability index $0.10$--$0.18$) sits in the same range as
+PredictStateCFM's ($0.12$--$0.13$) and below SDA's ($0.18$--$0.27$), with
+opposite tails --- too heavy for the filters, too light for PredictStateCFM and
+SDA. VanillaCFM is nearly flat ($0.03$--$0.11$). The operator-slot partition does
+not predict the ranking (source: \texttt{docs/results/l96\_rank\_histograms\_c4.md}).
+
+So C4 is not supported as a discriminating claim: $\PsiNG \equiv 0$ is a property
+of the ensemble-Kalman update, but neither the second moment nor the rank
+histogram shows it as a deficit specific to that class.
+
+\paragraph{Blending.}
+The deterministic/generative blend --- DirectUNet supplies the mean, an SDA
+prior samples the rest from an intermediate time --- is the most accurate scheme
+measured (0.312 at \Sz{}, CRPS 0.147) at spread/RMSE 0.53: better than SDA alone
+on accuracy, comparable on dispersion (0.42--0.54), below the flows (0.63--0.71).
+Averaging the velocities of several independently trained flows is the other
+route to accuracy that keeps calibration: three PredictStateCFM networks reach
+0.327 at unchanged spread/RMSE 0.63, at three times the cost
+(\texttt{docs/results/l96\_cfm\_velocity\_ensembles.md}).
+
+\subsection{A motivating ordering that is not yet evidence}
+\label{sec:ordering}
+
+At \Sz{} on Lorenz-96 the classical schemes do not order consistently by how
+much of the window they treat at once: on the regular grid ETKF (0.687) edges out
+the window variational method (Strong-4D-Var 0.703), which edges out EnKF
+(0.711); on the random observing system the window method leads (0.742 against
+0.798 and 0.850). All three are far behind the window-amortised learned schemes
+(0.31--0.50). Read against Table~\ref{tab:zeroing}, the ordering is \emph{not}
+monotone in the number of operator slots occupied --- EnKF fills $\PsiG$ and still
+trails a $\Psimean$-only variational scheme on both test sets.
+
+This is suggestive of H1 but \textbf{confounded}: amortisation, learning and
+capacity all vary at once, and the learned schemes see a training set the
+classical ones do not.
+\needsrun{Filter vs.\ window-smoother vs.\ window-amortised at matched model,
+matched observations and matched compute.}
+
+\paragraph{The observing system: what H1 buys, measured.}
+DA needs no retraining for a new observing system, and it shows. On a random
+observing system --- 10 to 100 observation times and 4 to 16 observed fast
+channels per window, the same layouts for every scheme --- DA loses
+$\times 1.06$--$1.20$ relative to the regular grid; learned schemes trained on a
+distribution of random observing systems lose $\times 1.24$--$1.32$ (the hybrids
+$\times 1.23$--$1.24$); SDA, which never sees observations in training, sits
+between the two ($\times 1.21$--$1.22$); and schemes trained on one fixed grid
+(the P1 protocol) lose $\times 2.7$--$3.3$. In the controlled observation-count
+sweep, ETKF is the best scheme at \Sz{} with 10 or fewer observations per window,
+and every learned scheme beats every DA baseline from about 20 on; under \So{} the
+learned schemes win at every density. The sweep does not include the hybrid: on
+the random test set binned by each window's own observation count, the SDA3-fix
+hybrid beats ETKF even in the sparsest bin (10--24 observations, $0.793$ against
+$1.032$). A factorised estimator
+adapts to any observation configuration for free; an amortised one must be
+trained on the distribution of configurations it will meet --- and then matches a
+fixed-grid model on that grid (PredictStateCFM 0.341 against 0.354) while being
+three times more robust off it.

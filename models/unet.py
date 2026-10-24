@@ -15,6 +15,33 @@ class SinusoidalEmbedding(nn.Module):
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
+class AttentionPool1D(nn.Module):
+    """Learned-query attention pooling over the time axis of (B, C, T).
+
+    A single learned query vector attends over the T timesteps and produces a
+    weighted mean ``(B, C)``. Unlike global average pooling, this lets the
+    network weight the timesteps that carry the most signal (e.g. where the
+    state response to a model parameter is strongest), which aids regression
+    of window-constant parameters whose effect unfolds over time.
+
+    A learned 1x1 ``key`` projection produces per-position keys so the query
+    can select positions, not channels: ``attn = softmax(query^T · key(x))``.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        self.query = nn.Parameter(torch.randn(1, channels) * (channels ** -0.5))
+        self.key = nn.Conv1d(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T)
+        keys = self.key(x)  # (B, C, T)
+        logits = torch.einsum("qc,bct->bt", self.query, keys) / math.sqrt(self.channels)  # (B, T)
+        attn = torch.softmax(logits, dim=-1).unsqueeze(1)  # (B, 1, T)
+        return (x * attn).sum(dim=-1)  # (B, C)
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_c: int, out_c: int, time_emb_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -72,13 +99,15 @@ class Up(nn.Module):
 
 
 class ConditionEncoder(nn.Module):
-    def __init__(self, state_dim: int, hidden_dim: int, use_obs: bool, use_energy: bool):
+    def __init__(self, state_dim: int, hidden_dim: int, use_obs: bool, use_energy: bool,
+                 obs_dim: int = None, cond_extra_dim: int = 0):
         super().__init__()
         self.use_obs = use_obs
         self.use_energy = use_energy
+        self.obs_dim = obs_dim if obs_dim is not None else state_dim
         proj_in = state_dim
         if use_obs:
-            proj_in += state_dim
+            proj_in += self.obs_dim + cond_extra_dim
         if use_energy:
             proj_in += state_dim * 3
         self.proj = nn.Linear(proj_in, hidden_dim) if proj_in != hidden_dim else nn.Identity()
@@ -106,22 +135,24 @@ class UNet1D(nn.Module):
         use_obs: bool = True,
         use_energy: bool = False,
         dropout: float = 0.1,
+        output_dim: int = None,
+        obs_dim: int = None,
+        cond_extra_dim: int = 0,
     ):
         super().__init__()
         if hidden_channels is None:
             hidden_channels = [64, 128, 256]
 
         self.state_dim = state_dim
+        self.output_dim = output_dim if output_dim is not None else state_dim
         self.use_obs = use_obs
         self.use_energy = use_energy
+        self.obs_dim = obs_dim if obs_dim is not None else state_dim
         self.time_emb_dim = time_emb_dim
         self.time_embed = SinusoidalEmbedding(time_emb_dim)
 
-        cond_dim = state_dim
-        if use_obs:
-            cond_dim += state_dim
-
-        self.cond_encoder = ConditionEncoder(state_dim, hidden_channels[0], use_obs, use_energy)
+        self.cond_encoder = ConditionEncoder(state_dim, hidden_channels[0], use_obs, use_energy,
+                                             obs_dim=self.obs_dim, cond_extra_dim=cond_extra_dim)
 
         self.enc_in = nn.Conv1d(hidden_channels[0], hidden_channels[0], 3, padding=1)
 
@@ -141,7 +172,7 @@ class UNet1D(nn.Module):
         self.enc_out = nn.Sequential(
             nn.Conv1d(in_c, in_c, 3, padding=1),
             nn.SiLU(),
-            nn.Conv1d(in_c, state_dim, 3, padding=1),
+            nn.Conv1d(in_c, self.output_dim, 3, padding=1),
         )
 
     def forward(

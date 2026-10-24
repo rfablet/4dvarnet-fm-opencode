@@ -1,0 +1,1351 @@
+import numpy as np
+import pytest
+import torch
+
+from data.normalization import compute_channel_stats
+from data.qg import (
+    QGConfig,
+    QGS01Dataset,
+    ensure_truth_only_cache,
+    make_qg_s0_s1_datasets,
+)
+from data.qg_neural import (
+    PARAM_KEYS,
+    QGNeuralDataset,
+    denorm_psi,
+    ensure_truth_cache,
+    layer_split,
+    num_days,
+    psi_daily,
+    psi_to_q,
+    q_daily,
+    q_from_psi_norm,
+    qg_collate,
+    steps_per_day,
+    window_scales,
+)
+from models.direct_unet import DirectUNet
+from models.vanilla_cfm import VanillaCFM
+
+
+def _cfg(**kw):
+    base = {"nx": 8, "window_days": 2.0, "spinup_years": 0.02,
+            "num_windows": 1, "obs_geometry": "random_columns",
+            "cols_per_day": 1, "R_var": 1e-12}
+    base.update(kw)
+    return QGConfig(**base)
+
+
+def _window(cfg=None, **kw):
+    cfg = cfg or _cfg(**kw)
+    ds = make_qg_s0_s1_datasets(cfg, num_test_windows=1,
+                                cache_dir="/tmp/qg_neural_test_cache")
+    return cfg, ds["test_s0"][0]
+
+
+def _window_with_wind(**kw):
+    """Like `_window`, but window index 1 (not 0): `data.qg._S1_WIND_LEVELS`
+    starts at 0.0, so index 0 always has a flat all-zero wind_curl field
+    (see PLAN.md's 2026-09-03 illustration-fix note for the same gotcha) --
+    unsuitable for testing forcing conditioning."""
+    cfg = _cfg(num_windows=2, **kw)
+    ds = make_qg_s0_s1_datasets(cfg, num_test_windows=2,
+                                cache_dir="/tmp/qg_neural_test_cache")
+    return cfg, ds["test_s0"][1]
+
+
+def _s0_s1_window_pair(**kw):
+    """S0- and S1-scenario-wrapped versions of the SAME underlying window
+    (index 1, nonzero wind -- see `_window_with_wind`), for cross-scenario
+    cond_mode="scenario" tests."""
+    cfg = _cfg(num_windows=2, **kw)
+    ds = make_qg_s0_s1_datasets(cfg, num_test_windows=2,
+                                cache_dir="/tmp/qg_neural_test_cache")
+    return cfg, ds["test_s0"][1], ds["test_s1"][1]
+
+
+def _psi_norm_stats(cfg, windows):
+    """Global per-layer psi (mean, std) stats, same shape `data.normalization`
+    (and `precompute_qg_norm_stats.py`) produce, over the given windows."""
+    split = layer_split(cfg)
+    layer1, layer2 = [], []
+    for w in windows:
+        ps = psi_daily(w, cfg)
+        layer1.append(ps[:, :split].reshape(-1))
+        layer2.append(ps[:, split:].reshape(-1))
+    psi_layers = torch.stack([torch.cat(layer1), torch.cat(layer2)], dim=-1)
+    return compute_channel_stats(psi_layers)
+
+
+def _param_norm_stats(windows):
+    """Global [U1,rd,rek] (mean, std) stats, same shape/format
+    `precompute_qg_norm_stats.py --output-params` produces. `std` is
+    clamped away from 0 -- in these tests' 1-2-window fixtures the params
+    can be degenerate (identical across the "split"), unlike the real
+    1000-window train split precompute_qg_norm_stats.py runs against."""
+    params = torch.tensor(
+        [[float(w["true_params"][k]) for k in PARAM_KEYS] for w in windows],
+        dtype=torch.float32)
+    stats = compute_channel_stats(params)
+    stats["std"] = stats["std"].clamp(min=1e-6)
+    return stats
+
+
+def _forcing_norm_stats(cfg, windows):
+    """Global scalar wind_curl (mean, std), same format
+    `precompute_qg_norm_stats.py --output-forcing` produces."""
+    from data.qg_neural import _daily_mean_field
+    spd = steps_per_day(cfg)
+    forcing = torch.cat([_daily_mean_field(w["wind_curl"], spd).reshape(-1) for w in windows])
+    stats = compute_channel_stats(forcing.reshape(-1, 1))
+    stats["std"] = stats["std"].clamp(min=1e-20)
+    return stats
+
+
+def test_psi_daily_matches_upper_field_daily_mean():
+    """`psi_daily` (streamfunctions of daily-mean q) matches the window's own
+    upper-layer psi target, daily-binned — the linearity psi=invert(q) holds."""
+    cfg, w = _window()
+    spd = steps_per_day(cfg)
+    split = layer_split(cfg)
+    ps = psi_daily(w, cfg)
+    assert ps.shape == (2, cfg.state_dim)
+    daily_upper = w["target_state_psi"].reshape(-1, split)
+    daily_upper = daily_upper[:cfg.num_steps].reshape(2, spd, split).mean(dim=1)
+    assert torch.allclose(ps[:, :split], daily_upper, atol=1e-3 * ps.abs().max())
+
+
+def test_q_daily_is_full_2layer_pv():
+    cfg, w = _window()
+    qs = q_daily(w, cfg)
+    assert qs.shape == (2, cfg.state_dim)
+    assert torch.isclose(qs.mean(), torch.tensor(0.0), atol=1e-6)
+
+
+def test_window_scales_make_otargets_unit_variance_per_layer():
+    """`window_scales` is no longer used to build training targets (that's now
+    global normalization, see `_psi_norm_stats`/`test_dataset_and_collate_shapes`)
+    but is retained as a diagnostic -- pin its own per-window-O(1) contract."""
+    cfg, w = _window()
+    sc = window_scales(w, cfg)
+    split = layer_split(cfg)
+    ps = psi_daily(w, cfg)
+    qs = q_daily(w, cfg)
+    psi_n = ps.clone()
+    qs_n = qs.clone()
+    psi_n[:, :split] = psi_n[:, :split] / sc.psi1
+    psi_n[:, split:] = psi_n[:, split:] / sc.psi2
+    qs_n[:, :split] = qs_n[:, :split] / sc.q1
+    qs_n[:, split:] = qs_n[:, split:] / sc.q2
+    assert sc.psi1 > 0 and sc.psi2 > 0 and sc.q1 > 0 and sc.q2 > 0
+    assert 0.5 < psi_n.std().item() < 2.0
+    assert 0.5 < qs_n.std().item() < 2.0
+
+
+def test_dataset_and_collate_shapes():
+    cfg, w = _window()
+    norm = _psi_norm_stats(cfg, [w])
+    ds = QGNeuralDataset([w], cfg, norm)
+    item = ds[0]
+    psi_n, obs_pad, mask, forcing, q_raw, rd, params, ic = item
+    split = layer_split(cfg)
+    days = 2
+    assert psi_n.shape == (days, 2 * split)
+    assert obs_pad.shape == (days, 2 * split)
+    assert mask.shape == (days, 2 * split)  # per-cell, matches obs_pad exactly
+    assert forcing.shape == (days, cfg.ny, cfg.nx)
+    assert torch.equal(forcing, torch.zeros_like(forcing))
+    assert q_raw.shape == (days, 2 * split)
+    assert rd.shape == (1,)
+    assert params is None
+    # obs (upper-layer psi) padded into the psi1 channel region only, no NaN
+    assert not torch.isnan(obs_pad).any()
+    assert obs_pad[:, split:].abs().sum() == 0.0
+    batch = qg_collate([item, ds[0]])
+    assert batch.states.shape == (2, days, 2 * split)
+    assert batch.obs_mask.shape == (2, days, 2 * split)
+    assert batch.states_q.shape == (2, days, 2 * split)
+    assert batch.rd.shape == (2,)
+    assert batch.forcing.shape == (2, days, cfg.ny, cfg.nx)
+    assert batch.params is None
+
+
+def test_global_normalization_makes_psi_unit_variance_but_leaves_q_raw():
+    """Global per-layer z-score normalization (the training-time scheme) maps
+    a window's psi close to unit variance when the window is near the global
+    mean/std it was computed from, while q is passed through unnormalized."""
+    cfg, w = _window()
+    norm = _psi_norm_stats(cfg, [w, w])  # stats computed on the same window(s)
+    ds = QGNeuralDataset([w], cfg, norm)
+    psi_n, _obs, _mask, _f, q_raw, _rd, _params, _ic = ds[0]
+    qs = q_daily(w, cfg)
+    assert torch.allclose(q_raw, qs)
+    # normalized against its own stats -> exactly unit variance per layer
+    split = layer_split(cfg)
+    assert torch.isclose(psi_n[:, :split].std(), torch.tensor(1.0), atol=0.05)
+    assert torch.isclose(psi_n[:, split:].std(), torch.tensor(1.0), atol=0.05)
+
+
+def test_dataset_without_norm_stats_is_raw_identity():
+    cfg, w = _window()
+    ds = QGNeuralDataset([w], cfg, psi_norm_stats=None)
+    psi_n, _obs, _mask, _f, _q, _rd, _params, _ic = ds[0]
+    assert torch.allclose(psi_n, psi_daily(w, cfg))
+
+
+def test_batch_to_device_and_params_attr():
+    cfg, w = _window()
+    ds = QGNeuralDataset([w, w], cfg)
+    batch = qg_collate([ds[0], ds[0]])
+    assert hasattr(batch, "params")
+    assert batch.params is None
+
+
+def test_denorm_psi_round_trip():
+    cfg, w = _window()
+    norm = _psi_norm_stats(cfg, [w, w])
+    ds = QGNeuralDataset([w], cfg, norm)
+    psi_n, _obs, _mask, _f, _q, _rd, _params, _ic = ds[0]
+    back = denorm_psi(psi_n, cfg, norm)
+    ps = psi_daily(w, cfg)
+    assert torch.allclose(back, ps, atol=1e-3 * ps.abs().max())
+
+
+def test_denorm_psi_identity_when_stats_none():
+    cfg, w = _window()
+    ps = psi_daily(w, cfg)
+    assert torch.equal(denorm_psi(ps, cfg, None), ps)
+
+
+def test_q_from_psi_norm_matches_raw_pv():
+    """Given the true (globally-normalized) psi, `q_from_psi_norm` recovers
+    the true raw-units PV up to the spectral-inversion round-off."""
+    cfg, w = _window()
+    norm = _psi_norm_stats(cfg, [w, w])
+    ds = QGNeuralDataset([w], cfg, norm)
+    psi_n, _obs, _mask, _f, q_true, _rd, _params, _ic = ds[0]
+    q_pred = q_from_psi_norm(psi_n, float(w["true_params"]["rd"]), cfg, norm,
+                             torch.device("cpu"))
+    assert torch.allclose(q_pred, q_true, atol=1e-3 * q_true.abs().max())
+
+
+def test_psi_to_q_does_not_move_shared_cpu_inverter():
+    """A GPU psi_to_q must not pollute the shared CPU inverter used by
+    psi_daily/window_scales (per-device cache separation)."""
+    cfg, w = _window()
+    from data.qg_neural import _INVERTER_CACHE
+    _INVERTER_CACHE.clear()
+    ps = psi_daily(w, cfg)
+    if torch.cuda.is_available():
+        q_gpu = psi_to_q(ps.clone().cuda(), float(w["true_params"]["rd"]),
+                         cfg, device=torch.device("cuda"))
+        assert q_gpu.is_cuda
+    # CPU path still works after a GPU call
+    q_cpu = psi_to_q(ps.clone(), float(w["true_params"]["rd"]), cfg)
+    assert not q_cpu.is_cuda
+
+
+def test_lightning_direct_unet_forward_backward_with_qloss():
+    _test_lightning_forward_backward("direct_unet")
+
+
+def test_lightning_vanilla_cfm_forward_backward_with_qloss():
+    _test_lightning_forward_backward("vanilla_cfm")
+
+
+def test_lightning_fourdvarnet_forward_backward_with_qloss():
+    _test_lightning_forward_backward("fourdvarnet")
+
+
+def test_lightning_fourdvarnet_with_aux_var_cost_weight():
+    """aux_var_cost_weight>0 (Q6's actual config value, 0.01) builds a
+    prior_unet and adds its consistency term to loss_psi -- must not raise
+    and must still produce finite gradients."""
+    from models.fourdvarnet import FourDVarNetSolver
+    from train_qg_neural import QGNeuralLightning
+    cfg = _cfg()
+    batch = _synth_batch(split=layer_split(cfg), rd=cfg.rd)
+    norm = {"mean": torch.zeros(2), "std": torch.ones(2)}
+    model = FourDVarNetSolver(state_dim=cfg.state_dim, hidden_channels=[8, 16, 32],
+                             time_emb_dim=16, N_outer=2, dropout=0.1,
+                             update_input="obs+state", unet_backbone="unet1d",
+                             aux_var_cost_weight=0.01)
+    assert model.prior_unet is not None
+    lit = QGNeuralLightning(model, "fourdvarnet", norm, cfg, q_loss_weight=0.1,
+                            use_cosine_scheduler=False)
+    opt = lit.configure_optimizers()
+    loss, _lp, _lq = lit._total_loss(batch)
+    assert torch.isfinite(loss)
+    opt.zero_grad()
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert len(grads) > 0
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def _synth_batch(split=64, days=30, rd=15000.0, b=2):
+    """Deterministic QGBatch with realistic shapes (no window generation),
+    whose normalized targets have O(1) per-layer scale like the real dataset."""
+    from data.qg_neural import QGBatch
+    split = int(split)
+    nyx = int(round(split ** 0.5))
+    assert nyx * nyx == split, "split must be a perfect square (QG is ny==nx)"
+    D = 2 * split
+    states = torch.randn(b, days, D)
+    states_q = torch.randn(b, days, D) * 1e-6
+    obs = torch.randn(b, days, D) * 0.5
+    mask = torch.ones(b, days, D, dtype=torch.bool)  # per-cell, matches real QGBatch.obs_mask
+    forcing = torch.zeros(b, days, nyx, nyx)
+    rd_t = torch.full((b,), rd, dtype=torch.float32)
+    return QGBatch(states, obs, mask, forcing, states_q, rd_t)
+
+
+def _test_lightning_forward_backward(model_type):
+    from train_qg_neural import QGNeuralLightning
+    cfg = _cfg()
+    batch = _synth_batch(split=layer_split(cfg), rd=cfg.rd)
+    norm = {"mean": torch.zeros(2), "std": torch.ones(2)}
+    if model_type == "direct_unet":
+        model = DirectUNet(state_dim=cfg.state_dim, param_dim=0, cond_extra_dim=0,
+                           hidden_channels=[8, 16, 32])
+    elif model_type == "fourdvarnet":
+        from models.fourdvarnet import FourDVarNetSolver
+        # unet_backbone="unet1d" (not "monai"): keeps this test independent
+        # of the optional monai dependency -- Q6's actual config uses
+        # "monai", covered separately (gated) elsewhere.
+        model = FourDVarNetSolver(state_dim=cfg.state_dim, hidden_channels=[8, 16, 32],
+                                  time_emb_dim=16, N_outer=2, dropout=0.1,
+                                  update_input="obs+state", unet_backbone="unet1d")
+    else:
+        model = VanillaCFM(state_dim=cfg.state_dim, param_dim=0, cond_extra_dim=0,
+                           hidden_channels=[8, 16, 32], time_emb_dim=16, N_outer=10,
+                           sigma_prior=0.5, dropout=0.1, train_tau_0_only=True)
+    # Cosine scheduler off: this test is about forward/backward loss
+    # correctness, not LR scheduling -- `opt` below is used as a plain
+    # optimizer (`opt.zero_grad()`), which configure_optimizers() only
+    # returns when the scheduler is disabled.
+    lit = QGNeuralLightning(model, model_type, norm, cfg, q_loss_weight=0.1,
+                            use_cosine_scheduler=False)
+    opt = lit.configure_optimizers()
+    loss, _lp, _lq = lit._total_loss(batch)
+    assert torch.isfinite(loss)
+    opt.zero_grad()
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert len(grads) > 0
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_lightning_fourdvarnet_monai_backbone_pads_nondivisible_days():
+    """Regression test for a real bug (found twice): unet_backbone="monai"
+    (MonaiUNet1D, DiffusionModelUNet) treats the T (days) axis as its own
+    downsampled "spatial" dim, requiring T divisible by
+    2**(len(hidden_channels)-1) (4 for a 3-level backbone) -- QG's 30-day
+    windows aren't. Crashed job 53462 in the main solve (fixed by
+    _pad_batch_for_monai1d), then crashed job 53467 in the separate
+    prior_unet consistency term (fixed by _padded_prior_cost) -- so this
+    test uses Q6's actual aux_var_cost_weight=0.01 (which builds a
+    prior_unet even for update_input="obs+state") to exercise both padding
+    paths, not just the main solve. days=30 (via _synth_batch's default)
+    with a 3-level hidden_channels here reproduces the exact failing
+    shape."""
+    pytest.importorskip("monai")
+    from models.fourdvarnet import FourDVarNetSolver
+    from train_qg_neural import QGNeuralLightning
+    cfg = _cfg()
+    batch = _synth_batch(split=layer_split(cfg), rd=cfg.rd, days=30)
+    norm = {"mean": torch.zeros(2), "std": torch.ones(2)}
+    model = FourDVarNetSolver(state_dim=cfg.state_dim, hidden_channels=[8, 16, 32],
+                             time_emb_dim=16, N_outer=2, dropout=0.1,
+                             update_input="obs+state", unet_backbone="monai",
+                             monai_num_res_blocks=1, monai_norm_num_groups=8,
+                             aux_var_cost_weight=0.01)
+    assert model.prior_unet is not None
+    lit = QGNeuralLightning(model, "fourdvarnet", norm, cfg, q_loss_weight=0.1,
+                            use_cosine_scheduler=False)
+    opt = lit.configure_optimizers()
+    loss, loss_psi, _lq = lit._total_loss(batch)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_psi)
+    opt.zero_grad()
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert len(grads) > 0
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_lightning_fourdvarnet_monai2d_backbone():
+    """unet_backbone="monai2d" (models.monai_unet_qg2d.MonaiUNet2DQGSolver,
+    Q6's actual backbone as of 2026-09-14) merges the T (days) axis into
+    the channel dimension instead of treating it as a downsampled
+    1D-sequence axis -- no T-divisibility constraint at all, so (unlike
+    "monai"'s test above) this must work with T=30 unpadded. Also confirms
+    QGNeuralLightning's fourdvarnet branch correctly skips the padding
+    wrapper for this backbone (unet_backbone != "monai")."""
+    pytest.importorskip("monai")
+    from models.fourdvarnet import FourDVarNetSolver
+    from train_qg_neural import QGNeuralLightning
+    cfg = _cfg()
+    batch = _synth_batch(split=layer_split(cfg), rd=cfg.rd, days=30)
+    norm = {"mean": torch.zeros(2), "std": torch.ones(2)}
+    ny = nx = int(round(layer_split(cfg) ** 0.5))
+    model = FourDVarNetSolver(state_dim=cfg.state_dim, hidden_channels=[8, 16, 32],
+                             N_outer=2, dropout=0.1, update_input="obs+state",
+                             unet_backbone="monai2d", monai_num_res_blocks=1,
+                             monai_norm_num_groups=4, aux_var_cost_weight=0.01,
+                             qg_T=30, qg_ny=ny, qg_nx=nx)
+    assert model.prior_unet is not None
+    lit = QGNeuralLightning(model, "fourdvarnet", norm, cfg, q_loss_weight=0.1,
+                            use_cosine_scheduler=False)
+    opt = lit.configure_optimizers()
+    loss, loss_psi, _lq = lit._total_loss(batch)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_psi)
+    opt.zero_grad()
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert len(grads) > 0
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_fourdvarnet_monai2d_requires_qg_shape_args():
+    pytest.importorskip("monai")
+    from models.fourdvarnet import FourDVarNetSolver
+    with pytest.raises(ValueError, match="qg_T"):
+        FourDVarNetSolver(state_dim=128, unet_backbone="monai2d")
+
+
+def test_estimate_windows_shapes():
+    from train_qg_neural import estimate_windows
+    # 30-day window so the UNet's time downsampling has enough samples
+    cfg = _cfg(window_days=30.0)
+    ds = make_qg_s0_s1_datasets(cfg, num_test_windows=1,
+                                cache_dir="/tmp/qg_neural_test_cache")
+    windows = list(ds["test_s0"])
+    model = VanillaCFM(state_dim=cfg.state_dim, param_dim=0, cond_extra_dim=0,
+                       hidden_channels=[8, 16, 32], time_emb_dim=16, N_outer=10,
+                       sigma_prior=0.5, dropout=0.1, train_tau_0_only=True)
+    est, rd = estimate_windows(model, windows, cfg, "vanilla_cfm", "cpu", n_members=2)
+    days = cfg.num_steps // steps_per_day(cfg)
+    assert est.shape == (1, days, cfg.state_dim)
+    assert rd.shape == (1,)
+    assert np.isfinite(est).all()
+
+
+def test_truth_only_plus_obs_ic_matches_generate_truth():
+    """Composing `_generate_truth_only` + `_generate_obs_ic` (keyed by the
+    same per-window index `i`) must reproduce what `_generate_truth` itself
+    produces for that index -- the split only changes what gets cached, not
+    the seeded data (this is exactly what `_generate_truth` does internally)."""
+    cfg = _cfg()
+    combined = QGS01Dataset._generate_truth(cfg, 2)
+    truth_only = QGS01Dataset._generate_truth_only(cfg, 2)
+    indices = list(range(2))
+    ics = QGS01Dataset._generate_obs_ic(cfg, truth_only, indices)
+    for full, part, ic in zip(combined, truth_only, ics):
+        assert torch.equal(full["true_state"], part["true_state"])
+        assert full["true_params"] == part["true_params"]
+        assert torch.equal(full["obs_mask"], ic["obs_mask"])
+        assert torch.allclose(
+            torch.nan_to_num(full["obs"]), torch.nan_to_num(ic["obs"]),
+        )
+        assert torch.equal(full["init_state"], ic["init_state"])
+
+
+def test_ensure_truth_only_cache_windows_lack_obs():
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    assert "obs" not in windows[0]
+    assert "true_state" in windows[0]
+
+
+def test_on_the_fly_obs_varies_across_draws_target_fixed():
+    """`on_the_fly_obs=True` redraws a different obs realization on every
+    `__getitem__` call, while the psi/q targets (from `true_state`) stay
+    identical -- diversity comes only from the obs/init-state resample."""
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    ds = QGNeuralDataset(windows, cfg, on_the_fly_obs=True)
+    psi_a, obs_a, _mask_a, _f_a, q_a, _rd_a, _params_a, _ic_a = ds[0]
+    psi_b, obs_b, _mask_b, _f_b, q_b, _rd_b, _params_b, _ic_b = ds[0]
+    assert torch.equal(psi_a, psi_b)
+    assert torch.equal(q_a, q_b)
+    assert not torch.equal(obs_a, obs_b)
+
+
+def test_cols_per_day_range_requires_on_the_fly_obs():
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    with pytest.raises(ValueError):
+        QGNeuralDataset(windows, cfg, on_the_fly_obs=False, cols_per_day_range=(1, 4))
+
+
+def test_cols_per_day_range_invalid_bounds_raises():
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    with pytest.raises(ValueError):
+        QGNeuralDataset(windows, cfg, on_the_fly_obs=True, cols_per_day_range=(4, 1))
+
+
+def test_cols_per_day_range_max_above_steps_per_day_raises():
+    """Regression test for a real bug: cols_per_day_range=(4, 24) hung a real
+    GPU job (job 53434) at dt=7200s (steps_per_day=12) -- 24 > 12 means the
+    per-day collision-avoidance loop in
+    `_generate_random_column_observations` can never find a free intra-day
+    slot once all 12 are taken and spins forever. Must be caught at
+    QGNeuralDataset construction time, not discovered by a hung job."""
+    cfg = _cfg()  # dt=7200.0 default -> steps_per_day=12
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    with pytest.raises(ValueError, match="steps_per_day"):
+        QGNeuralDataset(windows, cfg, on_the_fly_obs=True, cols_per_day_range=(4, 24))
+
+
+def test_cols_per_day_range_samples_within_bounds_and_varies():
+    """Obs-density-augmented training: every draw resamples cols_per_day
+    uniformly in [lo, hi] -- each day within one draw gets exactly that many
+    observed columns (`_generate_random_column_observations` always produces
+    the same per-day count for a given cfg), but the count itself varies
+    draw-to-draw."""
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    ds = QGNeuralDataset(windows, cfg, on_the_fly_obs=True, cols_per_day_range=(1, 4))
+    n_days = num_days(cfg)
+    counts = []
+    for _ in range(20):
+        w = ds._resolved_window(0)
+        n_obs = int(w["obs_mask"].sum())
+        assert n_obs % n_days == 0, "every day should get the same observed-column count"
+        counts.append(n_obs // n_days)
+    assert all(1 <= c <= 4 for c in counts)
+    assert len(set(counts)) > 1, "cols_per_day should vary across draws"
+
+
+def test_obs_mask_is_per_cell_not_per_day():
+    """Regression test for a real correctness bug: obs_mask used to be a
+    collapsed per-day boolean (True if *any* cell that day was observed),
+    which would make FourDVarNetSolver's variational obs cost treat every
+    unobserved cell's zero-fill on an "observed" day as a real obs=0
+    measurement. obs_mask must now match obs_pad's own shape exactly, be
+    True only at genuinely-observed cells, and be all-False on layer2
+    (never observed)."""
+    cfg, w = _window()
+    ds = QGNeuralDataset([w], cfg)
+    _psi, obs_pad, obs_mask, _forcing, _q, _rd, _params, _ic = ds[0]
+    split = layer_split(cfg)
+    assert obs_mask.shape == obs_pad.shape
+    assert obs_mask.dtype == torch.bool
+    assert not obs_mask[:, split:].any(), "layer2 is never observed"
+    # Every masked-True cell must correspond to a nonzero/real obs_pad entry
+    # (not the zero-fill used for unobserved cells) -- and vice versa,
+    # since obs_pad is only ever exactly 0.0 at unobserved cells (a real
+    # zero-valued observation is float noise, essentially never exactly 0).
+    assert torch.equal(obs_mask[:, :split], obs_pad[:, :split] != 0.0)
+
+
+def test_fixed_obs_dataset_is_deterministic_across_draws():
+    """Default `on_the_fly_obs=False` keeps returning the same baked-in obs
+    on repeated `__getitem__` calls (test/eval reproducibility, unchanged)."""
+    cfg, w = _window()
+    ds = QGNeuralDataset([w], cfg)
+    item_a = ds[0]
+    item_b = ds[0]
+    for a, b in zip(item_a, item_b):
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b)
+
+
+def test_cond_mode_none_requires_no_param_norm_stats():
+    cfg, w = _window()
+    QGNeuralDataset([w], cfg, cond_mode="none")  # must not raise
+
+
+def test_cond_mode_true_or_noisy_requires_param_norm_stats():
+    cfg, w = _window()
+    for mode in ("true", "noisy"):
+        try:
+            QGNeuralDataset([w], cfg, cond_mode=mode)
+            assert False, f"expected ValueError for cond_mode={mode!r} with no param stats"
+        except ValueError:
+            pass
+
+
+def test_cond_mode_true_or_noisy_requires_forcing_norm_stats():
+    """Regression test for a real bug: leaving the forcing field unnormalized
+    collapsed a full 200-epoch Q3 training run at epoch 28 (raw wind_curl is
+    ~1e-13-1e-12, ~12 orders of magnitude smaller than the unit-variance psi/
+    obs/param channels it's concatenated with). param_norm_stats alone must
+    not be enough -- forcing_norm_stats is also required."""
+    cfg, w = _window()
+    pstats = _param_norm_stats([w, w])
+    for mode in ("true", "noisy"):
+        try:
+            QGNeuralDataset([w], cfg, cond_mode=mode, param_norm_stats=pstats)
+            assert False, f"expected ValueError for cond_mode={mode!r} with no forcing stats"
+        except ValueError:
+            pass
+
+
+def test_cond_mode_true_matches_true_forcing_and_params():
+    """Q3 (oracle): forcing is the real true wind_curl field (daily-binned,
+    z-scored, nonzero, matching the window's own normalized wind_curl),
+    params are the exact normalized true_params -- deterministic across
+    repeated draws."""
+    cfg, w = _window_with_wind()
+    pstats = _param_norm_stats([w, w])
+    fstats = _forcing_norm_stats(cfg, [w, w])
+    ds = QGNeuralDataset([w], cfg, cond_mode="true", param_norm_stats=pstats,
+                        forcing_norm_stats=fstats)
+    _psi, _obs, _mask, forcing, _q, _rd, params, _ic = ds[0]
+    assert forcing.shape == (2, cfg.ny, cfg.nx)
+    assert forcing.abs().sum() > 0.0
+    spd = steps_per_day(cfg)
+    raw_forcing = w["wind_curl"].reshape(2, spd, cfg.ny, cfg.nx).mean(dim=1)
+    expected_forcing = (raw_forcing - fstats["mean"][0]) / fstats["std"][0]
+    assert torch.allclose(forcing, expected_forcing, atol=1e-5)
+    assert params.shape == (3,)
+    true_vec = torch.tensor([float(w["true_params"][k]) for k in PARAM_KEYS])
+    expected_params = (true_vec - pstats["mean"]) / pstats["std"]
+    assert torch.allclose(params, expected_params, atol=1e-4)
+    # deterministic: repeated draws give identical forcing/params
+    _psi2, _obs2, _mask2, forcing2, _q2, _rd2, params2, _ic2 = ds[0]
+    assert torch.equal(forcing, forcing2)
+    assert torch.equal(params, params2)
+
+
+def test_cond_mode_noisy_varies_across_draws_and_stays_finite():
+    """Q4: every draw resamples a fresh corruption severity -- forcing/params
+    should differ across repeated __getitem__ calls (unlike Q3's oracle),
+    while remaining finite and (params) still centered near the true value
+    since bias only ever reduces rd/rek toward, never past, 0."""
+    cfg, w = _window_with_wind()
+    pstats = _param_norm_stats([w, w])
+    fstats = _forcing_norm_stats(cfg, [w, w])
+    ds = QGNeuralDataset([w], cfg, cond_mode="noisy", param_norm_stats=pstats,
+                        forcing_norm_stats=fstats, noisy_max=1.5)
+    draws = [ds[0] for _ in range(5)]
+    forcings = torch.stack([d[3] for d in draws])
+    params = torch.stack([d[6] for d in draws])
+    assert torch.isfinite(forcings).all()
+    assert torch.isfinite(params).all()
+    assert not torch.equal(forcings[0], forcings[1])
+    assert not torch.equal(params[0], params[1])
+    # U1 is never biased by the noisy-params mechanism (only rd/rek are)
+    true_vec = torch.tensor([float(w["true_params"][k]) for k in PARAM_KEYS])
+    expected_u1 = (true_vec[0] - pstats["mean"][0]) / pstats["std"][0]
+    assert torch.allclose(params[:, 0], expected_u1.expand(5), atol=1e-4)
+
+
+def test_cond_mode_scenario_matches_true_on_s0_and_biased_on_s1():
+    """cond_mode="scenario" is the cross-scenario eval mode: on an S0-scenario
+    window it must match cond_mode="true" exactly (da_params/wind_state_corrupted
+    equal true_params/wind_state_true there), and on the SAME underlying
+    window's S1-scenario wrapper it must differ (biased rd/rek, corrupted
+    wind) -- deterministic, unlike cond_mode="noisy"."""
+    cfg, w_s0, w_s1 = _s0_s1_window_pair()
+    pstats = _param_norm_stats([w_s0, w_s0])
+    fstats = _forcing_norm_stats(cfg, [w_s0, w_s0])
+
+    ds_true = QGNeuralDataset([w_s0], cfg, cond_mode="true", param_norm_stats=pstats,
+                              forcing_norm_stats=fstats)
+    ds_scenario_s0 = QGNeuralDataset([w_s0], cfg, cond_mode="scenario",
+                                     param_norm_stats=pstats, forcing_norm_stats=fstats)
+    _p1, _o1, _m1, forcing_true, _q1, _r1, params_true, _ic1 = ds_true[0]
+    _p2, _o2, _m2, forcing_s0, _q2, _r2, params_s0, _ic2 = ds_scenario_s0[0]
+    assert torch.equal(forcing_true, forcing_s0)
+    assert torch.equal(params_true, params_s0)
+
+    ds_scenario_s1 = QGNeuralDataset([w_s1], cfg, cond_mode="scenario",
+                                     param_norm_stats=pstats, forcing_norm_stats=fstats)
+    _p3, _o3, _m3, forcing_s1, _q3, _r3, params_s1, _ic3 = ds_scenario_s1[0]
+    assert torch.isfinite(forcing_s1).all()
+    assert torch.isfinite(params_s1).all()
+    assert not torch.equal(params_s0, params_s1), (
+        "S1's biased da_params (rd/rek scaled by 1-s1_param_bias) must differ "
+        "from S0's true params")
+    assert not torch.equal(forcing_s0, forcing_s1), (
+        "S1's corrupted wind_state_corrupted must produce a different forcing "
+        "field than S0's true wind state")
+    # deterministic: repeated draws on the same S1 window give identical results
+    _p4, _o4, _m4, forcing_s1b, _q4, _r4, params_s1b, _ic4 = ds_scenario_s1[0]
+    assert torch.equal(forcing_s1, forcing_s1b)
+    assert torch.equal(params_s1, params_s1b)
+
+
+def test_include_ic_requires_psi_norm_stats():
+    cfg, w = _window()
+    try:
+        QGNeuralDataset([w], cfg, psi_norm_stats=None, include_ic=True)
+        assert False, "expected ValueError for include_ic=True with no psi_norm_stats"
+    except ValueError:
+        pass
+
+
+def test_include_ic_returns_normalized_psi_scale_ic_and_none_when_false():
+    """Q5: `ic` is the window's own init_state, inverted to psi and z-scored
+    with psi_norm_stats -- finite, plausible O(1)-ish scale (not raw q's
+    ~1e-5 scale), deterministic across repeated draws (unlike cond_mode
+    "noisy" forcing/params). `include_ic=False` (default) -> ic is None."""
+    cfg, w = _window()
+    norm = _psi_norm_stats(cfg, [w, w])
+    ds_no_ic = QGNeuralDataset([w], cfg, norm, include_ic=False)
+    item = ds_no_ic[0]
+    assert item[7] is None
+
+    ds = QGNeuralDataset([w], cfg, norm, include_ic=True)
+    item_a = ds[0]
+    ic = item_a[7]
+    split = layer_split(cfg)
+    assert ic.shape == (2 * split,)
+    assert torch.isfinite(ic).all()
+    assert ic.std() > 1e-3, f"ic std={ic.std():.3e} looks like raw q scale, not normalized psi"
+    item_b = ds[0]
+    assert torch.equal(ic, item_b[7])  # deterministic: init_state isn't resampled by include_ic
+
+
+def test_qg_collate_stacks_ic_when_present():
+    cfg, w = _window()
+    norm = _psi_norm_stats(cfg, [w, w])
+    ds = QGNeuralDataset([w, w], cfg, norm, include_ic=True)
+    batch = qg_collate([ds[0], ds[1]])
+    assert batch.ic is not None
+    assert batch.ic.shape == (2, 2 * layer_split(cfg))
+    ds_no_ic = QGNeuralDataset([w, w], cfg, norm, include_ic=False)
+    batch_no_ic = qg_collate([ds_no_ic[0], ds_no_ic[1]])
+    assert batch_no_ic.ic is None
+
+
+def test_ensure_truth_cache_redrawn_matches_plain_when_cfg_unchanged():
+    """Regression test for a real bug: naively calling `ensure_truth_cache`
+    with an obs/IC-protocol-overridden cfg (Q5's lag=5.0/noise=0.05) misses
+    the cache (`_truth_cache_path` hashes the whole QGConfig) and triggers a
+    full from-scratch truth rollout -- caught only after Q5/Q3-lag5 smoke
+    test jobs sat "hung" (actually silently regenerating truth) for ~10
+    minutes with no output. `ensure_truth_cache_redrawn` fixes this by
+    loading the cache at a separate, unaffected `cache_cfg` key and
+    redrawing obs/IC via `eval_cfg`. When `eval_cfg == cache_cfg` (the
+    Q1/Q3/Q4 case, no override), it must reproduce `ensure_truth_cache`'s
+    output (same underlying `_generate_truth_only` + `_generate_obs_ic`
+    composition, see `test_truth_only_plus_obs_ic_matches_generate_truth`).
+
+    `true_state`/`init_state` are compared exactly; `obs` is compared to
+    within a tight tolerance rather than bit-for-bit. Under torch 2.4 the two
+    paths agreed to the last bit, but they reach `_generate_obs_ic`'s
+    spectral field extraction with differently-shaped intermediates, and
+    torch >= 2.8 picks a different kernel for one of them -- a <=1 ULP
+    float32 difference (measured: max 6.1e-05 absolute, 7e-08 relative, on
+    obs of magnitude ~6e+02). That is ~6 orders of magnitude smaller than a
+    genuinely different obs realization, which is what this test guards
+    against."""
+    from data.qg_neural import ensure_truth_cache_redrawn
+    cfg = _cfg(num_windows=2)
+    cache_dir = "/tmp/qg_neural_test_cache"
+    plain = ensure_truth_cache(cfg, 2, cache_dir)
+    redrawn = ensure_truth_cache_redrawn(cfg, cfg, 2, cache_dir)
+    for a, b in zip(plain, redrawn):
+        assert torch.equal(a["true_state"], b["true_state"])
+        assert torch.allclose(torch.nan_to_num(a["obs"]), torch.nan_to_num(b["obs"]),
+                              rtol=1e-5, atol=1e-3)
+        assert torch.equal(a["init_state"], b["init_state"])
+
+
+def test_ensure_truth_cache_redrawn_uses_cache_cfg_key_not_eval_cfg():
+    """The whole point: an eval_cfg with a *different* obs_noise_std_frac/
+    init_lag_days must NOT change which cache file gets loaded (that's the
+    bug) -- only cache_cfg's key matters, and the redrawn windows' obs
+    actually reflect eval_cfg's (different) settings."""
+    from data.qg_neural import ensure_truth_cache_redrawn
+    cache_cfg = _cfg(num_windows=2)
+    cache_dir = "/tmp/qg_neural_test_cache"
+    ensure_truth_cache(cache_cfg, 2, cache_dir)  # populate the cache at cache_cfg's key
+    eval_cfg = _cfg(num_windows=2, obs_noise_std_frac=0.5, init_lag_days=1.5)
+    windows = ensure_truth_cache_redrawn(cache_cfg, eval_cfg, 2, cache_dir)
+    assert len(windows) == 2
+    # truth is identical (same cache_cfg key); obs noise scale reflects eval_cfg
+    plain = ensure_truth_cache(cache_cfg, 2, cache_dir)
+    for a, b in zip(plain, windows):
+        assert torch.equal(a["true_state"], b["true_state"])
+
+
+def test_cached_qg_dynamics_reused_and_matches_uncached():
+    """Regression test for the Q4 epoch-time fix: `_cached_qg_dynamics(cfg)`
+    must return the SAME object across repeated calls with an equal `cfg`
+    (not rebuild it every draw -- that rebuild was a measured ~2x epoch-time
+    bottleneck for Q4, since it happened on every training draw), and the
+    cached object's `wind_curl_field` output must be bitwise-identical to a
+    freshly-built one (the caching is a pure performance fix, no behavior
+    change)."""
+    from data.qg import _make_qg_dynamics
+    from data.qg_neural import _DYN_CACHE, _cached_qg_dynamics
+    _DYN_CACHE.clear()
+    cfg = _cfg()
+    dyn_a = _cached_qg_dynamics(cfg)
+    dyn_b = _cached_qg_dynamics(cfg)
+    assert dyn_a is dyn_b
+    fresh = _make_qg_dynamics(cfg)
+    wind_state = torch.tensor([[1e-11, cfg.L / 2, 0.0]] * 4, dtype=torch.float32)
+    assert torch.equal(dyn_a.wind_curl_field(wind_state), fresh.wind_curl_field(wind_state))
+    # a materially different cfg must NOT reuse the same cached object
+    cfg2 = _cfg(wind_sigma=cfg.wind_sigma * 2)
+    dyn_c = _cached_qg_dynamics(cfg2)
+    assert dyn_c is not dyn_a
+
+
+def test_qg_collate_stacks_params_when_present():
+    cfg, w = _window()
+    pstats = _param_norm_stats([w, w])
+    fstats = _forcing_norm_stats(cfg, [w, w])
+    ds = QGNeuralDataset([w, w], cfg, cond_mode="true", param_norm_stats=pstats,
+                        forcing_norm_stats=fstats)
+    batch = qg_collate([ds[0], ds[1]])
+    assert batch.params is not None
+    assert batch.params.shape == (2, 3)
+    assert batch.forcing.shape == (2, 2, cfg.ny, cfg.nx)
+
+
+def test_build_model_honors_yaml_param_dim_and_cond_extra_dim():
+    """Regression test for a bug where build_model() hardcoded param_dim=0/
+    cond_extra_dim=0 regardless of the experiment YAML's model.* fields.
+    QG's "direct_unet" is MONAI-backed (models.monai_unet_qg2d), so this
+    needs the fdv-monai-proto env -- skip if monai isn't installed (matches
+    tests/test_monai_unet_qg2d.py's gating; CI's default env has no monai,
+    see .github/workflows/ci.yml)."""
+    pytest.importorskip("monai")
+    from train_qg_neural import build_model
+    cfg = _cfg()
+    model = build_model("direct_unet", cfg, param_dim=4, cond_extra_dim=1)
+    assert model.param_dim == 4
+    assert model.cond_extra_dim == 1
+    obs_channels = model.unet.obs_channels
+    assert obs_channels == model.nlayers + 1 + 4
+
+
+def test_param_keys_are_never_zero_variance_across_windows():
+    """Regression test for a real bug caught by a training smoke test: `beta`
+    was originally included in PARAM_KEYS but `QGS01Dataset._generate_truth_only`
+    never jitters it (only U1/rd/rek get a per-window random draw, see
+    data/qg.py) -- it's an exact constant across the whole train split, so
+    z-scoring it divides by std=0 and poisons the loss to NaN within the
+    first epoch. Guards against reintroducing any such zero-variance key by
+    checking PARAM_KEYS' values actually differ across two independently
+    generated windows."""
+    from data.qg import QGS01Dataset
+    cfg = _cfg(num_windows=2)
+    windows = QGS01Dataset._generate_truth_only(cfg, 2)
+    for k in PARAM_KEYS:
+        v0, v1 = windows[0]["true_params"][k], windows[1]["true_params"][k]
+        assert v0 != v1, f"PARAM_KEYS entry {k!r} is constant across windows " \
+                          f"(both {v0!r}) -- would divide by std=0 when normalized"
+
+
+def test_q3_q4_yaml_configs_parse_cond_mode_as_string():
+    """Regression test for a real bug caught by a training smoke test: bare
+    `cond_mode: true` in YAML parses as the Python boolean True (a YAML
+    boolean literal), not the string "true" QGNeuralDataset expects --
+    train_qg_neural.py's main() would then pass cond_mode=True straight into
+    QGNeuralDataset, which raises ValueError. Q3's config must quote it
+    (`cond_mode: "true"`); this test loads the actual YAML files (unlike
+    the other cond_mode tests, which pass the Python string literal
+    directly and would never have caught this)."""
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name, expected_mode in [("Q3_direct_unet_s0_oracle_cond", "true"),
+                                ("Q4_direct_unet_s1_noisy_cond", "noisy")]:
+        cfg = OmegaConf.load(os.path.join(base, "config", "experiment", f"{name}.yaml"))
+        cond_mode = cfg.data.cond_mode
+        assert isinstance(cond_mode, str), (
+            f"{name}.yaml: cond_mode parsed as {type(cond_mode).__name__} "
+            f"({cond_mode!r}), not a string -- likely an unquoted YAML boolean")
+        assert cond_mode == expected_mode
+        assert int(cfg.model.param_dim) == 3
+        assert int(cfg.model.cond_extra_dim) == 1
+        assert cfg.data.param_norm_stats_path
+        assert cfg.data.forcing_norm_stats_path
+
+
+def test_q1_obsdensity_aug_yaml_config():
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(
+        base, "config", "experiment", "Q1_direct_unet_s0_obsdensity_aug.yaml"))
+    assert int(cfg.model.param_dim) == 0
+    assert int(cfg.model.cond_extra_dim) == 0
+    assert int(cfg.data.cols_per_day_min) == 4
+    assert int(cfg.data.cols_per_day_max) == 12
+    assert bool(cfg.data.on_the_fly_split_obs)
+
+
+def test_model_type_choices_include_every_build_model_branch():
+    """Regression test for a real bug: --model-type's argparse `choices`
+    list didn't get "fourdvarnet" added when that branch was added to
+    build_model() -- caught only at job-launch time (job 53460/53461),
+    "invalid choice" -- not by any test, since no test invoked the CLI
+    parser itself. Keeps the two lists in sync mechanically instead of by
+    memory."""
+    import ast
+    import os
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(base, "train_qg_neural.py")) as f:
+        tree = ast.parse(f.read())
+    build_model_types = set()
+    model_type_choices = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "build_model":
+            for n in ast.walk(node):
+                if (isinstance(n, ast.Compare) and isinstance(n.left, ast.Name)
+                        and n.left.id == "model_type"
+                        and isinstance(n.ops[0], ast.Eq)
+                        and isinstance(n.comparators[0], ast.Constant)):
+                    build_model_types.add(n.comparators[0].value)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "--model-type"):
+            for kw in node.keywords:
+                if kw.arg == "choices" and isinstance(kw.value, ast.List):
+                    model_type_choices = {
+                        elt.value for elt in kw.value.elts if isinstance(elt, ast.Constant)}
+    assert build_model_types, "couldn't find any model_type == '...' branch in build_model()"
+    assert model_type_choices, "couldn't find --model-type's choices list"
+    assert build_model_types == model_type_choices, (
+        f"build_model() supports {build_model_types} but --model-type's "
+        f"choices only allows {model_type_choices} -- keep these in sync")
+
+
+def test_q6_fourdvarnet_yaml_config():
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(base, "config", "experiment", "Q6_fourdvarnet_s0.yaml"))
+    assert cfg.model_type == "fourdvarnet"
+    assert int(cfg.model.param_dim) == 0
+    assert int(cfg.model.cond_extra_dim) == 0
+    assert cfg.model.fdv.unet_backbone == "monai2d"
+    assert float(cfg.model.fdv.aux_var_cost_weight) == 0.01
+    assert list(cfg.model.fdv.hidden_channels) == [32, 64, 128]
+    # MONAI requires every channel count -- including this backbone's
+    # internal T*channels_per_day totals -- to be a multiple of
+    # monai_norm_num_groups; a config-only mistake here fails at model
+    # construction, not YAML load, so check the divisibility directly.
+    groups = int(cfg.model.fdv.monai_norm_num_groups)
+    for c in list(cfg.model.fdv.hidden_channels) + [60, 120]:
+        assert c % groups == 0, f"{c} not divisible by monai_norm_num_groups={groups}"
+
+
+def test_q7_direct_unet_tchannels_yaml_config():
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(
+        base, "config", "experiment", "Q7_direct_unet_tchannels_s0.yaml"))
+    assert cfg.model_type == "direct_unet_tchannels"
+    assert int(cfg.model.param_dim) == 0
+    assert int(cfg.model.cond_extra_dim) == 0
+    assert list(cfg.model.hidden_channels) == [64, 128, 256]
+    # MONAI requires every channel count -- including this backbone's
+    # internal T*channels_per_day totals (120 in / 60 out at T=30,
+    # nlayers=2, hardcoded in train_qg_neural.py's build_model()) --
+    # divisible by the hardcoded norm_num_groups=4 there.
+    for c in list(cfg.model.hidden_channels) + [60, 120]:
+        assert c % 4 == 0, f"{c} not divisible by build_model()'s hardcoded norm_num_groups=4"
+
+
+def test_q1_direct_unet_tchannels_s0_yaml_config():
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(
+        base, "config", "experiment", "Q1_direct_unet_tchannels_s0.yaml"))
+    assert cfg.model_type == "direct_unet_tchannels"
+    assert int(cfg.model.param_dim) == 0
+    assert int(cfg.model.cond_extra_dim) == 0
+    assert float(cfg.training.gradient_clip_val) == 1.0
+    # Canonical T-channels obs-only baseline (2026-09-14, promoted from
+    # "Q7-noise05"): no obs_noise_std_frac/init_lag_days override -- picks
+    # up train_qg_neural.py's current fallback default (0.05/5.0) directly.
+    assert "obs_noise_std_frac" not in cfg.data
+    assert "init_lag_days" not in cfg.data
+
+
+def _tchannels_cond_yaml_config(filename, param_dim, cond_extra_dim, ic_dim=0):
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(base, "config", "experiment", filename))
+    assert cfg.model_type == "direct_unet_tchannels"
+    assert int(cfg.model.param_dim) == param_dim
+    assert int(cfg.model.cond_extra_dim) == cond_extra_dim
+    assert list(cfg.model.hidden_channels) == [64, 128, 256]
+    # in_ch_per_day = 2*nlayers + cond_extra_dim + param_dim + ic_dim
+    # (nlayers=2, hardcoded in build_model()'s direct_unet_tchannels branch).
+    in_ch_per_day = 2 * 2 + cond_extra_dim + param_dim + ic_dim
+    out_ch_per_day = 2  # nlayers
+    T = 30
+    for c in list(cfg.model.hidden_channels) + [T * in_ch_per_day, T * out_ch_per_day]:
+        assert c % 4 == 0, f"{c} not divisible by build_model()'s hardcoded norm_num_groups=4"
+    return cfg
+
+
+def test_q2_direct_unet_tchannels_oracle_cond_yaml_config():
+    cfg = _tchannels_cond_yaml_config(
+        "Q2_direct_unet_tchannels_s0_oracle_cond.yaml", param_dim=3, cond_extra_dim=1)
+    assert cfg.data.cond_mode == "true"
+    assert float(cfg.training.gradient_clip_val) == 1.0
+    # Canonical T-channels oracle-cond scheme (2026-09-14, promoted from
+    # "Q8"): no obs_noise_std_frac/init_lag_days override -- picks up
+    # train_qg_neural.py's current fallback default (0.05/5.0) directly.
+    assert "obs_noise_std_frac" not in cfg.data
+    assert "init_lag_days" not in cfg.data
+
+
+def test_q3_direct_unet_tchannels_noisy_cond_yaml_config():
+    cfg = _tchannels_cond_yaml_config(
+        "Q3_direct_unet_tchannels_s1_noisy_cond.yaml", param_dim=3, cond_extra_dim=1)
+    assert cfg.data.cond_mode == "noisy"
+    assert float(cfg.data.noisy_max) == 1.5
+    assert float(cfg.training.gradient_clip_val) == 1.0
+    assert "obs_noise_std_frac" not in cfg.data
+    assert "init_lag_days" not in cfg.data
+
+
+def test_q4_direct_unet_tchannels_noisy_ic_cond_yaml_config():
+    cfg = _tchannels_cond_yaml_config(
+        "Q4_direct_unet_tchannels_s1_noisy_ic_cond.yaml",
+        param_dim=3, cond_extra_dim=1, ic_dim=2)
+    assert cfg.data.cond_mode == "noisy"
+    assert float(cfg.data.noisy_max) == 2.0
+    assert bool(cfg.data.include_ic) is True
+    assert float(cfg.training.gradient_clip_val) == 1.0
+    assert "obs_noise_std_frac" not in cfg.data
+    assert "init_lag_days" not in cfg.data
+
+
+def test_normalized_forcing_is_order_one_not_raw_scale():
+    """Regression test for the training-collapse bug: raw wind_curl is
+    ~1e-13-1e-12 (see data/qg_neural.py's module docstring), ~12-13 orders
+    of magnitude smaller than the unit-variance psi/obs/param channels it's
+    concatenated with. After normalization the forcing values actually fed
+    to the model must be O(1)-ish (not still ~1e-12), or the fix is a no-op."""
+    cfg, w = _window_with_wind()
+    pstats = _param_norm_stats([w, w])
+    fstats = _forcing_norm_stats(cfg, [w, w])
+    raw_forcing = w["wind_curl"]
+    assert raw_forcing.abs().max() < 1e-9, (
+        "sanity check on the fixture itself: raw wind_curl should be tiny")
+    ds = QGNeuralDataset([w], cfg, cond_mode="true", param_norm_stats=pstats,
+                        forcing_norm_stats=fstats)
+    _psi, _obs, _mask, forcing, _q, _rd, _params, _ic = ds[0]
+    assert forcing.std() > 1e-3, (
+        f"normalized forcing std={forcing.std():.3e} is still tiny -- "
+        "normalization did not actually rescale it")
+
+
+def test_cols_sampling_override_uniform_slots_allows_dense_range():
+    """Train-split randomization (docs/plans/analysis/qg_specwind_neural.md §4.3):
+    cols_per_day ~ U{3..30} with uniform (step, column) slots, past the
+    sequential sampler's steps_per_day cap; the shared cfg is untouched."""
+    cfg = _cfg()  # dt=7200 -> 12 steps/day, nx=8 -> 96 slots/day
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    ds = QGNeuralDataset(windows, cfg, on_the_fly_obs=True, cols_per_day_range=(3, 30),
+                         cols_sampling="uniform_slots")
+    n_days = num_days(cfg)
+    counts = []
+    for _ in range(20):
+        w = ds._resolved_window(0)
+        n_slots = sum(len(c) for c in w["obs_columns"] if c is not None)
+        assert n_slots % n_days == 0
+        counts.append(n_slots // n_days)
+    assert all(3 <= c <= 30 for c in counts)
+    assert max(counts) > steps_per_day(cfg)
+    assert cfg.cols_sampling == "sequential"
+    _psi, obs_pad, obs_mask, *_ = ds[0]
+    assert obs_mask.any() and torch.isfinite(obs_pad).all()
+
+
+def test_cols_sampling_override_requires_on_the_fly_obs():
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    with pytest.raises(ValueError, match="on_the_fly_obs"):
+        QGNeuralDataset(windows, cfg, on_the_fly_obs=False, cols_sampling="uniform_slots")
+    with pytest.raises(ValueError, match="unknown cols_sampling"):
+        QGNeuralDataset(windows, cfg, on_the_fly_obs=True, cols_sampling="bogus")
+
+
+SPECWIND_TIERS = {
+    "G1S_direct_unet_tchannels_specwind.yaml": ([32, 64, 128], 3_676_476),
+    "G1_direct_unet_tchannels_specwind.yaml": ([64, 128, 256], 14_541_372),
+    "G1L_direct_unet_tchannels_specwind.yaml": ([128, 256, 512], 57_836_604),
+}
+
+
+@pytest.mark.parametrize("filename", sorted(SPECWIND_TIERS))
+def test_specwind_g1_tier_yaml_builds_its_tier(filename):
+    """The YAML's hidden_channels selects the built capacity for the
+    T-channels types (it used to be a dead field), and the observing system
+    matches the gyrostat DA rows (3 cols/day, 5% white)."""
+    import os
+
+    from omegaconf import OmegaConf
+
+    from train_qg_neural import build_model
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(base, "config", "experiment", filename))
+    hidden, n_params = SPECWIND_TIERS[filename]
+    assert cfg.model_type == "direct_unet_tchannels"
+    assert list(cfg.model.hidden_channels) == hidden
+    assert int(cfg.data.cols_per_day) == 3
+    assert float(cfg.data.obs_noise_std_frac) == 0.05
+    assert cfg.data.train_cols_sampling == "uniform_slots"
+    assert (int(cfg.data.cols_per_day_min), int(cfg.data.cols_per_day_max)) == (3, 30)
+    model = build_model("direct_unet_tchannels", QGConfig(nx=64), use_obs_mask=bool(cfg.model.use_obs_mask),
+                        hidden_channels=list(cfg.model.hidden_channels),
+                        num_res_blocks=int(cfg.model.num_res_blocks))
+    assert sum(p.numel() for p in model.parameters()) == n_params
+
+
+@pytest.mark.parametrize("filename,model_type", [
+    ("G2_vanilla_cfm_tchannels_specwind.yaml", "vanilla_cfm_tchannels"),
+    ("G3_sda_prior_tchannels_specwind.yaml", "sda_prior_tchannels"),
+])
+def test_specwind_flow_yaml_configs(filename, model_type):
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(base, "config", "experiment", filename))
+    assert cfg.model_type == model_type
+    assert list(cfg.model.hidden_channels) == [64, 128, 256]
+    assert int(cfg.data.cols_per_day) == 3
+
+
+def test_build_model_refuses_a_tier_for_untiered_types():
+    from train_qg_neural import build_model
+    with pytest.raises(ValueError, match="fixed M tier"):
+        build_model("direct_unet", QGConfig(nx=64), hidden_channels=[32, 64, 128])
+
+
+def test_warmup_cosine_factor_shape():
+    from train_qg_neural import warmup_cosine_factor
+    f = warmup_cosine_factor(100, 1000)
+    assert f(0) == pytest.approx(0.01)
+    assert f(50) == pytest.approx(0.01 + 0.99 * 0.5)
+    assert f(100) == pytest.approx(1.0)
+    assert f(550) == pytest.approx(0.5)
+    assert f(1000) == pytest.approx(0.0, abs=1e-12)
+    values = [f(s) for s in range(100, 1001, 50)]
+    assert all(a >= b for a, b in zip(values, values[1:]))
+    assert warmup_cosine_factor(100, 1000, cosine=False)(900) == 1.0
+
+
+def test_configure_optimizers_without_warmup_keeps_the_epoch_cosine():
+    from train_qg_neural import QGNeuralLightning
+    lit = QGNeuralLightning(torch.nn.Linear(2, 2), "direct_unet_tchannels", None, QGConfig(nx=16),
+                            max_epochs=200)
+    out = lit.configure_optimizers()
+    assert isinstance(out["lr_scheduler"], torch.optim.lr_scheduler.CosineAnnealingLR)
+    assert out["lr_scheduler"].T_max == 200
+
+
+def test_decoder_output_module_found_on_the_tchannels_backbone():
+    from train_qg_neural import build_model, decoder_output_module
+    cfg = QGConfig(nx=16)
+    assert decoder_output_module(build_model("direct_unet_tchannels", cfg)) is not None
+    assert decoder_output_module(torch.nn.Linear(2, 2)) is None
+
+
+@pytest.mark.parametrize("filename", [
+    "G1S_direct_unet_tchannels_specwind.yaml", "G1_direct_unet_tchannels_specwind.yaml",
+    "G1L_direct_unet_tchannels_specwind.yaml", "G2_vanilla_cfm_tchannels_specwind.yaml",
+    "G3_sda_prior_tchannels_specwind.yaml"])
+def test_specwind_configs_share_the_stabilized_protocol(filename):
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(base, "config", "experiment", filename))
+    assert float(cfg.training.lr) == 3e-4
+    assert int(cfg.training.warmup_epochs) == 5
+    assert float(cfg.training.q_loss_weight_scale) == 3.0
+    assert float(cfg.training.gradient_clip_val) == 1.0
+
+
+def test_configure_optimizers_with_warmup_steps_per_batch():
+    from types import SimpleNamespace
+
+    from train_qg_neural import QGNeuralLightning
+    lit = QGNeuralLightning(torch.nn.Linear(2, 2), "direct_unet_tchannels", None, QGConfig(nx=16),
+                            lr=3e-4, max_epochs=200, warmup_epochs=5)
+    lit._trainer = SimpleNamespace(estimated_stepping_batches=200 * 500)
+    out = lit.configure_optimizers()
+    sched = out["lr_scheduler"]
+    assert sched["interval"] == "step"
+    opt = out["optimizer"]
+    assert opt.param_groups[0]["lr"] == pytest.approx(3e-6)
+    for _ in range(2500):
+        opt.step()
+        sched["scheduler"].step()
+    assert opt.param_groups[0]["lr"] == pytest.approx(3e-4)
+
+
+def test_pass_correlated_error_on_both_obs_layouts():
+    import numpy as np
+
+    from data.qg_neural import add_pass_correlated_error
+    ny = 16
+    dense = torch.full((6, ny), float("nan"))
+    dense[1] = 0.0
+    dense[4] = 0.0
+    out = add_pass_correlated_error(dense, 2.0, ny, np.random.default_rng(0))
+    assert torch.isnan(out[[0, 2, 3, 5]]).all()
+    for t in (1, 4):
+        d = out[t].double()
+        lin = torch.linspace(-1, 1, ny, dtype=torch.float64)
+        resid = d - (d.mean() + (d * lin).sum() / (lin * lin).sum() * lin)
+        assert float(resid.abs().max()) < 1e-5
+    grouped = [None, torch.zeros(3 * ny), None]
+    g = add_pass_correlated_error(grouped, 2.0, ny, np.random.default_rng(1))
+    assert g[0] is None and g[2] is None
+    cols = g[1].reshape(3, ny)
+    assert not torch.allclose(cols[0], cols[1])
+    rms = [float(add_pass_correlated_error(torch.zeros(1, ny), 2.0, ny, np.random.default_rng(s))
+                 .pow(2).mean().sqrt()) for s in range(400)]
+    assert float(np.sqrt(np.mean(np.square(rms)))) == pytest.approx(2.0, rel=0.1)
+
+
+def test_obs_error_aug_draws_within_range_and_needs_on_the_fly_obs():
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    with pytest.raises(ValueError, match="on_the_fly_obs"):
+        QGNeuralDataset(windows, cfg, obs_error_aug=(0.05, 0.15, 0.15))
+    with pytest.raises(ValueError):
+        QGNeuralDataset(windows, cfg, on_the_fly_obs=True, obs_error_aug=(0.2, 0.1, 0.1))
+    ds = QGNeuralDataset(windows, cfg, on_the_fly_obs=True, obs_error_aug=(0.05, 0.15, 0.15),
+                         cols_per_day_range=(3, 12), cols_sampling="uniform_slots")
+    for _ in range(50):
+        white, corr = ds._draw_obs_error()
+        assert 0.05 <= white <= 0.15 and 0.0 <= corr <= 0.15
+    _psi, obs_pad, obs_mask, *_ = ds[0]
+    assert obs_mask.any() and torch.isfinite(obs_pad).all()
+    assert cfg.obs_noise_std_frac == _cfg().obs_noise_std_frac
+
+
+def test_obs_error_aug_raises_the_obs_error():
+    """A draw at the S1 end of the range carries more error than the S0 draw of the same window."""
+    import random as _random
+
+    from data.qg_neural import psi_upper
+    cfg = _cfg()
+    windows = ensure_truth_only_cache(cfg, 1, "/tmp/qg_neural_test_cache")
+    truth = psi_upper(windows[0], cfg).reshape(-1, cfg.ny, cfg.nx)
+
+    def err(aug):
+        ds = QGNeuralDataset(windows, cfg, on_the_fly_obs=True, obs_error_aug=aug)
+        errs = []
+        for seed in range(10):
+            _random.seed(seed)
+            w = ds._resolved_window(0)
+            for t in w["obs_mask"].nonzero().flatten().tolist():
+                errs.append((w["obs"][t] - truth[t, :, int(w["obs_columns"][t])]).pow(2).mean())
+        return float(torch.stack(errs).mean().sqrt())
+    assert err((0.15, 0.15, 0.15)) > 2.0 * err((0.05, 0.05, 1e-9))
+
+
+@pytest.mark.parametrize("filename,aug", [
+    ("G1S_direct_unet_tchannels_specwind.yaml", True), ("G1_direct_unet_tchannels_specwind.yaml", True),
+    ("G1L_direct_unet_tchannels_specwind.yaml", True), ("G2_vanilla_cfm_tchannels_specwind.yaml", True),
+    ("G3_sda_prior_tchannels_specwind.yaml", False)])
+def test_specwind_obs_error_aug_covers_s0_to_s1(filename, aug):
+    import os
+
+    from omegaconf import OmegaConf
+
+    from evaluation.qg_specwind_s1 import REALISTIC_SELECTED, REALISTIC_VARIANTS, S0_OBS_WHITE
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = OmegaConf.load(os.path.join(base, "config", "experiment", filename))
+    if not aug:
+        assert cfg.data.get("obs_error_aug") is None
+        return
+    lo, hi, corr = (float(v) for v in cfg.data.obs_error_aug)
+    s1 = REALISTIC_VARIANTS[REALISTIC_SELECTED]
+    assert lo == S0_OBS_WHITE and hi == s1.obs_white_frac and corr == s1.obs_corr_frac
+
+
+@pytest.mark.parametrize("batch", [16, 64])
+def test_g1l_large_batch_configs_differ_only_by_the_budget(batch):
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "experiment")
+    ref = OmegaConf.load(os.path.join(base, "G1L_direct_unet_tchannels_specwind.yaml"))
+    cfg = OmegaConf.load(os.path.join(base, f"G1L_direct_unet_tchannels_specwind_b{batch}.yaml"))
+    assert cfg.experiment_id == f"G1L_direct_unet_tchannels_specwind_b{batch}"
+    assert cfg.model == ref.model
+    t = cfg.training
+    assert (int(t.batch_size), int(t.epochs), float(t.lr), int(t.warmup_epochs), int(t.num_workers)) == (
+        batch, 1200, 5e-4, 40, 10)
+    assert int(cfg.data.regen_every) == 30
+    for k in ("q_loss_weight_scale", "gradient_clip_val"):
+        assert t[k] == ref.training[k]
+    assert {k: v for k, v in cfg.data.items() if k != "regen_every"} == dict(ref.data)
+
+
+def test_train_cli_budget_flags_default_to_the_yaml():
+    """--epochs / --batch-size / --num-workers / --regen-every must default to None so the
+    experiment YAML's values apply (the sbatch passes them only when set)."""
+    import ast
+    import os
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tree = ast.parse(open(os.path.join(base, "train_qg_neural.py")).read())
+    defaults = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "add_argument"
+                and node.args and isinstance(node.args[0], ast.Constant)):
+            for kw in node.keywords:
+                if kw.arg == "default" and isinstance(kw.value, ast.Constant):
+                    defaults[node.args[0].value] = kw.value.value
+    for flag in ("--epochs", "--batch-size", "--num-workers", "--regen-every"):
+        assert defaults.get(flag, "missing") is None, flag
+
+
+def test_g1m_b16_config_is_g1l_b16_at_the_m_tier():
+    import os
+
+    from omegaconf import OmegaConf
+    base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "experiment")
+    m = OmegaConf.load(os.path.join(base, "G1_direct_unet_tchannels_specwind_b16.yaml"))
+    lg = OmegaConf.load(os.path.join(base, "G1L_direct_unet_tchannels_specwind_b16.yaml"))
+    assert m.experiment_id == "G1_direct_unet_tchannels_specwind_b16"
+    assert list(m.model.hidden_channels) == [64, 128, 256]
+    assert {k: v for k, v in m.model.items() if k != "hidden_channels"} == {
+        k: v for k, v in lg.model.items() if k != "hidden_channels"}
+    assert m.training == lg.training and m.data == lg.data
+
+
+def test_g1xl_b16_config_is_g1l_b16_with_a_fourth_level_and_half_the_peak_lr():
+    import os
+
+    from omegaconf import OmegaConf
+
+    from train_qg_neural import build_model
+    base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "experiment")
+    xl = OmegaConf.load(os.path.join(base, "G1XL_direct_unet_tchannels_specwind_b16.yaml"))
+    lg = OmegaConf.load(os.path.join(base, "G1L_direct_unet_tchannels_specwind_b16.yaml"))
+    assert xl.experiment_id == "G1XL_direct_unet_tchannels_specwind_b16"
+    assert list(xl.model.hidden_channels) == [128, 256, 512, 512]
+    assert {k: v for k, v in xl.model.items() if k != "hidden_channels"} == {
+        k: v for k, v in lg.model.items() if k != "hidden_channels"}
+    assert float(xl.training.lr) == 2.5e-4
+    assert {k: v for k, v in xl.training.items() if k != "lr"} == {
+        k: v for k, v in lg.training.items() if k != "lr"}
+    assert xl.data == lg.data
+    model = build_model("direct_unet_tchannels", QGConfig(nx=64), use_obs_mask=True,
+                        hidden_channels=list(xl.model.hidden_channels),
+                        num_res_blocks=int(xl.model.num_res_blocks))
+    assert sum(p.numel() for p in model.parameters()) == 96_133_180

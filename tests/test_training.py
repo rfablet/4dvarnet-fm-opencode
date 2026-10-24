@@ -1,6 +1,5 @@
 """Tests for Lightning training pipeline."""
 import os
-import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -9,8 +8,7 @@ from training.lightning_module import LitModel as Lit4DVarNetFM
 from training.losses import StateMSELoss
 from training.stage1 import train_stage1
 from training.stage2 import train_stage2
-from data.lorenz63 import Lorenz63Dataset
-from data.dataloader import FlowMatchingDataset, collate_fm, FlowMatchingBatch
+from data.dataloader import collate_fm
 
 
 class _FixedDataset(Dataset):
@@ -24,7 +22,8 @@ class _FixedDataset(Dataset):
         return self.states.shape[0]
 
     def __getitem__(self, idx):
-        return self.states[idx], self.obs[idx], self.mask[idx]
+        forcing = torch.zeros(self.states.shape[1], dtype=torch.float32)
+        return self.states[idx], self.obs[idx], self.mask[idx], forcing
 
 
 def _make_fixed_loader(B=2, T=50, D=3):

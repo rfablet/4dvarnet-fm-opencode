@@ -1,0 +1,164 @@
+\section{Evaluation framework}
+\label{sec:evaluation}
+
+\subsection{Three case studies, three jobs}
+\label{sec:testbeds}
+
+The three systems are not a repeated benchmark; each answers a question the
+others cannot.
+
+\begin{description}[leftmargin=2em,style=nextline]
+  \item[\textnormal{\textbf{Lorenz-63 --- the model-error axis, including the
+    formulation that relaxes H2.}}]
+    A stochastic Lorenz-63 system augmented with a wind-forcing variable. Small
+    enough that weak-constraint 4D-Var, which explicitly frees a per-step model
+    error term, is affordable to run. This matters because weak-constraint
+    4D-Var is the classical method \emph{allowed} to know about model error, and
+    is therefore the honest ceiling against which H2's cost must be measured.
+  \item[\textnormal{\textbf{Lorenz-96 --- the main testbed.}}]
+    Two-scale Lorenz-96: eight slow variables coupled to fast variables,
+    integrated with RK4 over 500-step assimilation windows. Observations cover a
+    24-dimensional subspace of a 40-dimensional state. Every window draws its own
+    physical parameters, randomised by $\pm 20\%$, so no method can memorise a
+    single setting. This is the only system carrying the full scheme matrix, and
+    all cross-class comparisons are made here.
+  \item[\textnormal{\textbf{Quasi-geostrophic channel --- representation and
+    realism.}}]
+    A two-layer Phillips-type channel integrated in potential vorticity $q$ with
+    a spectral inversion for the streamfunction $\psi$, forced by a moving-storm
+    wind-stress curl. Observations are sparse meridional columns. Its role is
+    H3a: the same physics admits two state variables, which is the cleanest
+    available test that the representation is not a neutral container.
+\end{description}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+& \textbf{DA baselines} & \textbf{DirectUNet} & \textbf{CFM} & \textbf{SDA} & \textbf{DirectUNet$+$SDA} \\
+\midrule
+Lorenz-63 & \checkmark\ (incl.\ weak-4D-Var) & --- & --- & --- & --- \\
+Lorenz-96 & \checkmark\ (\emph{no} weak-4D-Var) & \checkmark & \checkmark & \checkmark & \checkmark \\
+QG        & \checkmark\ (incl.\ weak-4D-Var) & \checkmark & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\caption{Scheme coverage. The matrix is deliberately uneven: cross-class claims
+are made on Lorenz-96, where every class is present, and the other two systems
+carry the specific arguments described above. \todo{Fill the empty cells, or
+state in the final version that they are out of scope rather than pending.}}
+\label{tab:coverage}
+\end{table}
+
+\subsection{Schemes}
+\label{sec:schemes}
+
+Five classes, mapped onto Table~\ref{tab:zeroing}:
+\textbf{(i)} classical DA --- strong- and weak-constraint 4D-Var, EnKF, ETKF;
+\textbf{(ii)} \textbf{DirectUNet}, a single-pass supervised regression
+$\Cv \mapsto \hat{\xv}$, i.e.\ a pure $\Psimean$ estimator;
+\textbf{(iii)} \textbf{CFM}, a conditional flow trained on the interpolant
+\eqref{eq:interpolant};
+\textbf{(iv)} \textbf{SDA}, score-based assimilation with an unconditional or
+conditioned prior and observation guidance;
+\textbf{(v)} \textbf{DirectUNet\,$+$\,SDA}, blending, where the deterministic
+estimate supplies $\Psimean$ and the sampler supplies the remaining slots.
+
+Unrolled variational solvers are deliberately excluded. They are a fourth
+operator family whose analysis requires the gradient machinery this paper does
+not introduce, and they are treated separately.
+
+\subsection{The Lorenz-96 protocol}
+\label{sec:protocol}
+
+\paragraph{Test sets.} The same 200 windows, scored twice: on a regular grid of 30
+observation times with all 16 fast channels observed, and on a random observing
+system (10 to 100 observation times per window, stratified, the first step always
+observed, and 4 to 16 observed fast channels per window). Every scheme, classical
+and learned, sees exactly the same observations, noise and \So{} forcing, checked
+window by window.
+
+\paragraph{Training (benchmark default).} Learned schemes are trained on a random
+observing system redrawn for every window of every batch, with fresh noise: 10 to
+300 observation times, 4 to 16 observed fast channels. Validation windows are
+re-observed once from the same distribution, so checkpoint selection measures a
+random observing system. 1200 epochs, cosine-annealed learning rate, normalised
+states, three seeds per scheme. The earlier \emph{P1 protocol} --- one fixed
+30-observation grid, observation noise frozen per window across epochs --- is
+reported only as a reference: it overfits the frozen noise.
+
+\paragraph{The SDA priors are the exception.} They never see observations in
+training (observations enter only as the guidance cost at sampling), so the
+observing-system protocol is inert for them. But \textbf{they are trained for 400
+epochs, not 1200}: same data, backbone, schedule and three seeds, and a third of
+the budget. The 400$\to$1200 increase gained the other learned families
+$9$--$19\%$ (Section~\ref{sec:overview}), and it has not been run for SDA, so
+every SDA row --- and the prior inside every DirectUNet$\to$SDA hybrid --- is
+at a budget disadvantage of unmeasured size.
+\needsrun{SDA1/SDA2/SDA3-fix-M at 1200 epochs, three seeds, and the hybrids
+re-evaluated on those priors.}
+
+\paragraph{Inference settings.} Flows are sampled with 30 members and 20 Euler
+steps on an early-fine grid $\tau_k = 1-(1-k/20)^{1/2}$. SDA uses 30 members, 10
+guided steps and guidance weight 25; the DirectUNet$\to$SDA hybrid starts the SDA
+sampler from the DirectUNet estimate at $\tau_0 = 0.1$ with guidance weight 2. Both
+weights were tuned on validation windows disjoint from the test set. The DA
+baselines receive each window's parameters --- including the fast-variable
+coupling weights --- as their forward model (biased at \So{}), with ETKF/EnKF
+inflation 1.5 at \Sz{} and 2.0 at \So{}.
+
+\subsection{The model-error axis}
+\label{sec:s0s1}
+
+\begin{description}[leftmargin=2em,style=nextline]
+  \item[\Sz{} (perfect model).] The assimilating model's parameters equal those
+    generating the truth for that window. (Earlier drafts' Lorenz-96 DA numbers
+    were not perfect-model: the fast-variable coupling weights never reached the
+    DA forward model. Fixing this, with the per-case inflation, lowered the \Sz{} RMSE of ETKF
+    from 0.866 to 0.687 and of Strong-4D-Var from 0.738 to 0.703; the numbers here are the fixed
+    ones.)
+  \item[\So{} (model error).] The assimilating model's parameters carry an
+    additional $\pm 10\%$ bias. The truth is drawn from the same distribution in
+    both scenarios; only $\thv^{*}$ changes.
+\end{description}
+
+\paragraph{A caveat that must be stated, not cashed in.}
+The \Sz{}/\So{} axis prices model error \emph{only for methods that run a forward
+model at inference}. A learned estimator receiving no parameters and integrating
+nothing is definitionally unaffected, and its $\So/\Sz \approx 1.00$ is not a
+robustness result. Three classes must therefore be kept apart
+(Table~\ref{tab:classes}), and a model-free ratio is never tabled as cross-class
+robustness evidence.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}p{0.24\textwidth}p{0.36\textwidth}p{0.32\textwidth}@{}}
+\toprule
+\textbf{class} & \textbf{what \So{} changes for it} & \textbf{a ratio $\approx 1.00$ means} \\
+\midrule
+classical DA & integrates a biased forward model; the bias compounds through the
+integration & n/a --- these degrade by $2.0$--$2.2\times$ on L96 \\
+model-free learned (DirectUNet, CFM, unconditional SDA) & nothing: no parameters,
+no forward model & \emph{definitional}; carries no information \\
+conditioned learned (SDA2/SDA3; QG Q2--Q4) & the conditioning inputs
+$(\zv^{*},\thv^{*})$ are biased or corrupted & a genuine robustness result ---
+obtained only when trained on noisy conditioning (Section~\ref{sec:inert}) \\
+\bottomrule
+\end{tabular}
+\caption{What \So{} means depends on whether, and how, a scheme consumes model
+information. This governs every cross-class statement in the paper.}
+\label{tab:classes}
+\end{table}
+
+\subsection{Metrics}
+RMSE is computed per window over the observed subspace and averaged over windows,
+with the same convention for every scheme.
+Explained variance is reported per field. For ensemble schemes the spread/skill
+ratio is compared against the finite-ensemble reliability target
+$\sqrt{(N-1)/(N+1)}$, and proper ensemble CRPS / energy scores are computed at a
+single uniform convention, $N=30$.
+
+Rank histograms, with spread and per-channel mean bias corrected in turn to
+separate second-moment, first-moment and shape errors, complement spread/RMSE
+(Section~\ref{sec:nongaussian}).
